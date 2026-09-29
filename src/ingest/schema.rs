@@ -498,7 +498,7 @@ fn table_from_create_table(
     let mut columns = Vec::new();
     let mut indexes: Vec<Index> = Vec::new();
     if has_id {
-        let opts = ColumnOpts { nullable: Some(false), default: None, limit: None };
+        let opts = ColumnOpts { nullable: Some(false), default: None, limit: None, array: false };
         let key = match id_type.as_deref() {
             None | Some("bigint") | Some("primary_key") => Ok(Column {
                 name: Symbol::from(id_name.as_str()),
@@ -786,6 +786,10 @@ struct ColumnOpts {
     nullable: Option<bool>,
     default: Option<String>,
     limit: Option<u32>,
+    /// `array: true` — a Postgres array column (`t.string :tags, array:
+    /// true`). Wraps the resolved base `ColumnType` in `ColumnType::Array`
+    /// in `column_with_type` below.
+    array: bool,
 }
 
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
@@ -806,6 +810,7 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
+                "array" => opts.array = bool_value(value).unwrap_or(false),
                 _ => {}
             }
         }
@@ -820,9 +825,10 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
 /// and a PG `enum` are strings. `timestamp` is Rails' own alias for
 /// `datetime` (`TableDefinition#timestamp`), which a MySQL-backed
 /// app's `schema.rb` dumps for a `TIMESTAMP` column — lobsters'
-/// `story_texts.created_at`. A type not listed is an error, not a
-/// silent drop — its index would still be emitted and the DDL would
-/// not apply (#83).
+/// `story_texts.created_at`. `opts.array` (`array: true`) wraps
+/// whichever base type this resolves to in `ColumnType::Array`. A
+/// type not listed is an error, not a silent drop — its index would
+/// still be emitted and the DDL would not apply (#83).
 fn column_with_type(
     type_name: &str,
     col_name: String,
@@ -851,11 +857,14 @@ fn column_with_type(
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: format!(
-                    "column dropped: {table}.{col_name} has unsupported type `{type_name}`"
+                    "column dropped: unsupported type `{type_name}` ({table}.{col_name})"
                 ),
             })
         }
     };
+    // `array: true` wraps the resolved base type — `t.string :tags,
+    // array: true` is a `text[]`-shaped column, not a `string`.
+    let col_type = if opts.array { ColumnType::Array { elem: Box::new(col_type) } } else { col_type };
 
     Ok(Column {
         name: Symbol::from(col_name),

@@ -74,6 +74,16 @@ pub enum ColumnType {
     /// per-dialect renderer can still tell the two apart.
     Uuid,
     Reference { table: TableRef },
+
+    /// `t.string :tags, array: true` (schema.rb) / `text[]`, `bigint[]`,
+    /// … (a Postgres `structure.sql` dump) — a Postgres array column,
+    /// carrying the element type. SQLite has no array type; the DDL
+    /// renderer stores these as TEXT (JSON-encoded — the honest SQLite
+    /// representation, not a silent scalarization) and the model layer
+    /// types the attribute `Array[<elem>]`. Ranges (`tstzrange`, …) and
+    /// custom composite types are unaffected — still ledgered as
+    /// unsupported, same as before this variant existed.
+    Array { elem: Box<ColumnType> },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -117,7 +117,10 @@ end
         "db/schema.rb",
     )
     .expect_err("strict ingest must fail on a column it cannot model");
-    assert!(err.to_string().contains("geo.location has unsupported type `st_point`"), "{err}");
+    // Reason first, identifier in parens — see `survey::bucket_key`,
+    // which truncates the message at the first `(` so every column
+    // dropped for the SAME unsupported type buckets together.
+    assert!(err.to_string().contains("unsupported type `st_point` (geo.location)"), "{err}");
 
     // Survey mode: ledgered, the rest of the schema still lands.
     roundhouse::ingest::survey::activate();

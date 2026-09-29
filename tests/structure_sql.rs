@@ -174,9 +174,16 @@ fn ingests_tables_columns_indexes_fk_and_pk() {
     assert!(matches!(fk.on_delete, roundhouse::schema::ReferentialAction::Cascade));
 
     // Ledgered gaps: the dropped tstzrange column and the unmodeled view.
+    // The message is reason-first, identifier-in-parens (`column
+    // dropped: unsupported type \`tstzrange\` (widgets.schedule)`) so
+    // every dropped column of the SAME unsupported type buckets
+    // together instead of one bucket per column — see
+    // `survey::bucket_key`, which truncates at the first `(`.
     let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
     assert!(
-        messages.iter().any(|m| m.contains("column dropped: widgets.schedule") && m.contains("tstzrange")),
+        messages.iter().any(|m| {
+            m.contains("column dropped: unsupported type `tstzrange`") && m.contains("(widgets.schedule)")
+        }),
         "{messages:?}"
     );
     assert!(
@@ -374,4 +381,74 @@ ALTER TABLE ONLY shard.readings_p0
     // than ledgering a gap for a table nobody will ever see.
     let pk_gaps = gaps.iter().filter(|g| format!("{g}").contains("primary key dropped")).count();
     assert_eq!(pk_gaps, 1, "{gaps:?}");
+}
+
+/// A Postgres array column (`text[]`, `bigint[]`, …) models as
+/// `ColumnType::Array { elem }` rather than being dropped and ledgered.
+/// Before this, every array column in a real dump (Procore has ~1,800)
+/// was ledgered individually, one bucket per column, burying the real
+/// gap list.
+#[test]
+fn array_columns_are_modeled_not_ledgered() {
+    let sql = r#"
+CREATE TABLE public.widgets (
+    id bigint NOT NULL,
+    tags text[],
+    counts bigint[],
+    labels character varying(255)[]
+);
+"#;
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode never errors");
+    let gaps = survey::drain();
+
+    let widgets = &schema.tables[&Symbol::from("widgets")];
+    assert_eq!(
+        col(widgets, "tags").col_type,
+        ColumnType::Array { elem: Box::new(ColumnType::Text) }
+    );
+    assert_eq!(
+        col(widgets, "counts").col_type,
+        ColumnType::Array { elem: Box::new(ColumnType::BigInt) }
+    );
+    // The limit captured before the `[]` suffix is stripped survives
+    // onto the wrapped element type.
+    assert_eq!(
+        col(widgets, "labels").col_type,
+        ColumnType::Array { elem: Box::new(ColumnType::String { limit: Some(255) }) }
+    );
+
+    // No "column dropped" gap for any of the three array columns.
+    let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
+    assert!(
+        !messages.iter().any(|m| m.contains("column dropped")),
+        "array columns should not be ledgered: {messages:?}"
+    );
+}
+
+/// An array of an unmapped base type (a range, a custom composite type,
+/// …) is still a dropped column, not silently scalarized — arrays only
+/// gained a `ColumnType` mapping for base types that already had one.
+#[test]
+fn array_of_an_unsupported_base_type_is_still_ledgered() {
+    let sql = r#"
+CREATE TABLE public.widgets (
+    id bigint NOT NULL,
+    schedules tstzrange[]
+);
+"#;
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode never errors");
+    let gaps = survey::drain();
+
+    let widgets = &schema.tables[&Symbol::from("widgets")];
+    assert!(widgets.columns.iter().all(|c| c.name.as_str() != "schedules"));
+
+    let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
+    assert!(
+        messages.iter().any(|m| {
+            m.contains("column dropped: unsupported type `tstzrange[]`") && m.contains("(widgets.schedules)")
+        }),
+        "{messages:?}"
+    );
 }
