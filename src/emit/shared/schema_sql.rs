@@ -140,5 +140,11 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
         | ColumnType::Json
         | ColumnType::Uuid => "TEXT",
         ColumnType::Reference { .. } => "INTEGER",
+        // SQLite has no array type. The element type is intentionally
+        // NOT recursed into here (a `TEXT[]` and an `INTEGER[]` column
+        // store the same way): the honest SQLite representation of a
+        // Postgres array column is JSON-encoded TEXT, same storage
+        // seam as `Json` above.
+        ColumnType::Array { .. } => "TEXT",
     }
 }

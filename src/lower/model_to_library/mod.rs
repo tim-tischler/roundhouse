@@ -1939,6 +1939,10 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
         ColumnType::Json => Ty::Str,
         ColumnType::Uuid => Ty::Str,
         ColumnType::Reference { .. } => Ty::Int,
+        // Same as `Json` just above: stored TEXT (JSON-encoded — see
+        // `emit::shared::schema_sql`), nothing decodes it. See the
+        // longer rationale on `ingest::model::ty_of_column`'s twin arm.
+        ColumnType::Array { .. } => Ty::Str,
     }
 }
 

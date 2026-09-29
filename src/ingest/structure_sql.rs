@@ -345,23 +345,28 @@ fn parse_column_def(
 fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> IngestError {
     IngestError::Unsupported {
         file: file.into(),
-        message: format!("column dropped: {table}.{col} has unsupported type `{type_name}`"),
+        message: format!("column dropped: unsupported type `{type_name}` ({table}.{col})"),
     }
 }
 
 /// A Postgres type phrase (e.g. `character varying(255)`, `timestamp(6)
-/// without time zone`, `numeric(20,2)`, `public.widget_status`) to its
-/// `ColumnType`, mirroring exactly what `ingest_schema::column_with_type`
-/// maps for the equivalent `schema.rb` type name (see
-/// `src/ingest/schema.rs`) — including that mapping's own known limits:
-/// `numeric`/`decimal` never carry precision/scale (schema.rb ingest
-/// never captures them either, so this stays parity rather than a new
-/// capability), and array columns are never coerced to their base type
-/// (there is no `array: true` notion on `ColumnType`). Enum-typed
-/// columns (a name registered by a preceding `CREATE TYPE … AS ENUM`)
-/// map to `String`, same as schema.rb's own `enum` → `String`. Returns
-/// `None` for anything with no mapping — the caller ledgers that as a
-/// dropped column, never a silent one.
+/// without time zone`, `numeric(20,2)`, `public.widget_status`,
+/// `bigint[]`) to its `ColumnType`, mirroring exactly what
+/// `ingest_schema::column_with_type` maps for the equivalent `schema.rb`
+/// type name (see `src/ingest/schema.rs`) — including that mapping's
+/// own known limits: `numeric`/`decimal` never carry precision/scale
+/// (schema.rb ingest never captures them either, so this stays parity
+/// rather than a new capability). Enum-typed columns (a name registered
+/// by a preceding `CREATE TYPE … AS ENUM`) map to `String`, same as
+/// schema.rb's own `enum` → `String`. An array suffix (`<base>[]`) wraps
+/// whichever `ColumnType` the base resolves to in `ColumnType::Array` —
+/// the same shape schema.rb's `array: true` produces — resolved BEFORE
+/// the `[]` is stripped is captured, so `character varying(255)[]`
+/// still keeps its limit. Returns `None` for anything with no mapping
+/// (a base type with no arm, or an array of one) — the caller ledgers
+/// that as a dropped column, never a silent one. Ranges (`tstzrange`,
+/// `daterange`, `int4range`) and other custom types stay unmapped,
+/// same as before this function gained array support.
 fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Option<ColumnType> {
     let (mut base, num1, _num2) = strip_parens_capture_nums(type_phrase);
     let is_array = base.ends_with("[]");
@@ -372,14 +377,9 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
     if let Some(dot) = base.rfind('.') {
         base = base[dot + 1..].to_string();
     }
-    if is_array {
-        // `text[]`, `bigint[]`, … — no array notion on `ColumnType`;
-        // ledgered by the caller rather than silently scalarized.
-        return None;
-    }
 
     let limit = || num1.and_then(|n| u32::try_from(n).ok());
-    Some(match base.as_str() {
+    let elem = match base.as_str() {
         "integer" | "int" | "int4" | "smallint" | "int2" => ColumnType::Integer,
         "bigint" | "int8" | "bigserial" | "serial8" => ColumnType::BigInt,
         "serial" | "serial4" => ColumnType::Integer,
@@ -402,7 +402,8 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
         "interval" => ColumnType::String { limit: None },
         other if enum_types.contains(other) => ColumnType::String { limit: None },
         _ => return None,
-    })
+    };
+    Some(if is_array { ColumnType::Array { elem: Box::new(elem) } } else { elem })
 }
 
 // ---------------------------------------------------------------------
@@ -1277,7 +1278,19 @@ mod tests {
             Some(ColumnType::Decimal { precision: None, scale: None })
         ));
         assert!(resolve_column_type("tstzrange", &enums).is_none());
-        assert!(resolve_column_type("bigint[]", &enums).is_none());
+        assert!(matches!(
+            resolve_column_type("bigint[]", &enums),
+            Some(ColumnType::Array { elem }) if *elem == ColumnType::BigInt
+        ));
+        // The limit captured before the `[]` suffix is stripped must
+        // survive onto the wrapped element type.
+        assert!(matches!(
+            resolve_column_type("character varying(255)[]", &enums),
+            Some(ColumnType::Array { elem }) if *elem == ColumnType::String { limit: Some(255) }
+        ));
+        // An array of an unmapped base type (a range, say) is still a
+        // dropped column, not silently scalarized.
+        assert!(resolve_column_type("tstzrange[]", &enums).is_none());
     }
 
     #[test]

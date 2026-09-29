@@ -1556,6 +1556,16 @@ fn ty_of_column(t: &ColumnType) -> Ty {
         ColumnType::Json => Ty::Str,
         ColumnType::Uuid => Ty::Str,
         ColumnType::Reference { .. } => Ty::Int,
+        // Same rationale as `ColumnType::Json` just above: stored TEXT
+        // (JSON-encoded — see `emit::shared::schema_sql`), and nothing
+        // parses it into a real Array yet. Structure for an array
+        // column would need a `has_array`-style opt-in declaration
+        // analogous to `has_json` (`lower::has_json`); until one
+        // exists, claiming `Ty::Array` here would be a reader
+        // signature the emitted body doesn't back (DEVELOPMENT.md
+        // invariant 6) — there is no `parse_db_time`-style intrinsic
+        // for arrays the way there is for temporal columns.
+        ColumnType::Array { .. } => Ty::Str,
     }
 }
 
