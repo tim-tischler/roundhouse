@@ -65,6 +65,46 @@ fn a_lambda_target_before_action_gates_the_action_it_guards() {
         .assert_passes();
 }
 
+/// A concern-exported macro whose body mixes a class-level config
+/// write with real filter DSL — `permit_with`'s actual shape
+/// (`ingest::app::expand_class_body_macros`'s partial-expansion
+/// policy). `gate_with` stores a flag on the class AND registers
+/// `before_action :guard`; the config write earns a quiet ledger note
+/// and is otherwise dropped, but the `before_action` must still make
+/// it into the emitted dispatcher and actually run. Scoped to `:show`
+/// alone so the rest of `articles_controller_test.rb` is unaffected.
+#[test]
+fn a_config_write_beside_filter_dsl_still_runs_the_filter() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/concerns/feature_gate.rb",
+            "module FeatureGate\n  \
+               extend ActiveSupport::Concern\n\n  \
+               class_methods do\n    \
+                 def gate_with(flag, **options)\n      \
+                   self.feature_flag = flag\n      \
+                   before_action :guard, options\n    \
+                 end\n  \
+               end\n\n  \
+               private\n\n  \
+               def guard\n    \
+                 redirect_to root_path\n  \
+               end\nend\n",
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "class ArticlesController < ApplicationController\n  before_action :set_article",
+            "class ArticlesController < ApplicationController\n  include FeatureGate\n  gate_with :maintenance, only: [:show]\n  before_action :set_article",
+        )
+        .edit(
+            "test/controllers/articles_controller_test.rb",
+            "test \"should show article\" do\n    get article_url(@article)\n    assert_response :success\n    assert_select \"h1\", @article.title\n    assert_select \"h2\", \"Comments\"\n    assert_select \"#comments .p-4\", minimum: 1\n  end",
+            "test \"a config write beside filter DSL still lets the filter run\" do\n    get article_url(@article)\n    assert_redirected_to root_url\n  end",
+        )
+        .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
 /// #139 typed `Model.human_attribute_name` as a String, which took the
 /// call from an error to clean, but no runtime defines it, so every
 /// page rendering the form raises `undefined method
