@@ -1502,7 +1502,7 @@ fn normalize_classvars_to_ivars(e: &mut Expr) {
 
 /// Synthesize `def <name>; @<name>; end` (instance receiver) or
 /// `def self.<name>; @<name>; end` (class receiver).
-fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+pub(crate) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::Ivar { name: name.clone() },
@@ -1548,7 +1548,7 @@ fn retarget_module_function_calls(expr: &mut Expr, owner: &ClassId, promoted: &[
 
 /// Synthesize the writer pair for `attr_writer` / `attr_accessor`,
 /// honoring the receiver (Instance vs Class).
-fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+pub(crate) fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
     let value_param = Symbol::from("value");
     let rhs = Expr::new(
         Span::synthetic(),
@@ -2212,6 +2212,7 @@ fn block_form_concern_filter(stmt: &ruby_prism::Node<'_>, file: &str) -> Option<
         if_cond_expr: None,
         unless_cond_expr: None,
         block: Some(expr),
+        prepend: false,
     })
 }
 
