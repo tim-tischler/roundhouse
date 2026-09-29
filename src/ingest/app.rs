@@ -2454,6 +2454,32 @@ fn expand_class_body_macros(app: &mut App) {
                         });
                     }
                 }
+                None if is_method_wrapping_noop(&body) => {
+                    // `memoize :y` (Procore's `Memoizer`), `instrument_methods
+                    // :a, :b` (`procore-instrumentation`) — a concern-exported
+                    // macro whose whole body redefines an EXISTING method in
+                    // place (`alias_method`, `define_method`, `prepend` of an
+                    // anonymous wrapper module, `class_eval`) rather than
+                    // adding to the class's visible surface. Roundhouse
+                    // doesn't model the wrap (the wrapped method still runs
+                    // unwrapped in the emitted program), but that's a
+                    // narrower, quieter gap than "not expanded" implies —
+                    // filter DSL was never the shape here — so it gets its
+                    // own line instead of the generic one, and is dropped
+                    // rather than round-tripped: nothing replays a
+                    // controller's `Unknown` items today (see
+                    // `lower_controller_to_library_class`), so keeping it
+                    // would only feed the generic ledger a second time via
+                    // `report_unrecognized_controller_macros`.
+                    survey::record(&IngestError::Unsupported {
+                        file: format!("{}", controller.name.0.as_str()),
+                        message: format!(
+                            "class-body macro wraps existing methods: `{}` from {} (treated as a no-op)",
+                            method.as_str(),
+                            module.0.as_str()
+                        ),
+                    });
+                }
                 None => {
                     survey::record(&IngestError::Unsupported {
                         file: format!("{}", controller.name.0.as_str()),
@@ -2469,6 +2495,91 @@ fn expand_class_body_macros(app: &mut App) {
         }
         controller.body = expanded;
     }
+}
+
+/// Whether a concern-exported class-body macro's (already
+/// param-substituted) body redefines an EXISTING method in place
+/// without changing the class's visible method set — every leaf
+/// statement is `alias_method`, `define_method`, `prepend` (of an
+/// anonymous wrapper module built with `Module.new do … end`), or
+/// `class_eval`, once the ordinary Ruby SCAFFOLDING around them is
+/// unwrapped: a loop over the macro's own argument list (the
+/// multi-name form every real macro of this shape writes —
+/// `method_names.each do |name| … end`), an `if`/`unless` guard, a
+/// `raise`, or a local variable holding a derived name.
+///
+/// Procore's `Memoizer::ClassMethods#memoize` is exactly this,
+/// wrapped one level deeper than the simplest case: `method_names.each
+/// do |method_name| … end` where the block guards with `raise
+/// UnsupportedMethod if …`, computes two derived names into locals,
+/// `define_method`s the memoized wrapper, and `alias_method`s the
+/// original aside. The `procore-instrumentation` gem's
+/// `instrument_methods` is the same idiom. When every leaf statement
+/// matches (and at least one is a real wrap call — a body that's
+/// nothing but guards doesn't vacuously pass), the macro is a no-op
+/// for our purposes: it wraps, it doesn't add or remove anything an
+/// emitted caller needs to see — so `expand_class_body_macros` reports
+/// it under a specific, quieter line instead of the generic "not
+/// expanded" one that would otherwise apply to any macro body
+/// `filters_from_macro_body` can't read as filter DSL.
+fn is_method_wrapping_noop(body: &crate::expr::Expr) -> bool {
+    use crate::expr::{ExprNode, LValue, Literal};
+
+    fn is_wrap_call(expr: &crate::expr::Expr) -> bool {
+        matches!(
+            &*expr.node,
+            ExprNode::Send { recv: None, method, .. }
+                if matches!(method.as_str(), "alias_method" | "define_method" | "class_eval" | "prepend")
+        )
+    }
+
+    fn contains_wrap_call(expr: &crate::expr::Expr) -> bool {
+        if is_wrap_call(expr) {
+            return true;
+        }
+        let mut found = false;
+        expr.node.for_each_child(&mut |c| {
+            found = found || contains_wrap_call(c);
+        });
+        found
+    }
+
+    fn is_noop_body(body: &crate::expr::Expr) -> bool {
+        let statements: Vec<&crate::expr::Expr> = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            _ => vec![body],
+        };
+        statements.into_iter().all(is_noop_stmt)
+    }
+
+    fn is_noop_stmt(stmt: &crate::expr::Expr) -> bool {
+        if is_wrap_call(stmt) {
+            return true;
+        }
+        match &*stmt.node {
+            // The synthesized placeholder for an omitted `if`/`unless`
+            // else branch (`ingest_expr`'s `If` arm fills the missing
+            // side with a `Nil` literal, not an empty `Seq`) — the
+            // common case, since a guard clause with no `else` is
+            // exactly what these macros write.
+            ExprNode::Lit { value: Literal::Nil } => true,
+            ExprNode::Send { method, .. } if method.as_str() == "raise" => true,
+            ExprNode::Assign { target: LValue::Var { .. }, .. } => true,
+            ExprNode::If { then_branch, else_branch, .. } => {
+                is_noop_body(then_branch) && is_noop_body(else_branch)
+            }
+            // A loop (or any other call-with-block) over the macro's
+            // own arguments — the container itself changes nothing;
+            // only its block body's statements can.
+            ExprNode::Send { block: Some(b), .. } => match &*b.node {
+                ExprNode::Lambda { body, .. } => is_noop_body(body),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    contains_wrap_call(body) && is_noop_body(body)
 }
 
 /// The macro's body with its parameters replaced by the call's

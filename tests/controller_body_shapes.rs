@@ -1,9 +1,9 @@
 //! Controller class-body shapes beyond Symbol-target filter DSL and
 //! `def`/`include`: a lambda/block-target `before_action`, and the
 //! plain-Ruby class-body macros (`attr_reader`, `alias_method`,
-//! `prepend`, `private_constant`, `helper`, `using`) that a
-//! controller's own ingest used to fall through to `Unknown` and then
-//! flag as "controller class-body macro not recognized".
+//! `prepend`, `private_constant`, `undef_method`, `helper`, `using`)
+//! that a controller's own ingest used to fall through to `Unknown`
+//! and then flag as "controller class-body macro not recognized".
 //!
 //! F28 (lambda filters): `before_action -> { … }, only: […]` and
 //! `before_action { … }` both register on the guarded action, running
@@ -14,7 +14,11 @@
 //! accessor methods, `alias_method` clones the aliased method,
 //! `prepend` is read like `include`, `private_constant`/`helper` are
 //! silent no-ops, and `using` earns a specific ledger line instead of
-//! the generic "not recognized" one.
+//! the generic "not recognized" one. `memoize :a`, exported from a
+//! concern whose body is pure `alias_method`/`define_method` (the
+//! `Memoizer`/`instrument_methods` shape), earns the quieter
+//! "wraps existing methods" ledger line instead of the generic
+//! "not expanded" one.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +28,32 @@ use roundhouse::ingest::ingest_app_from_tree;
 
 const APPLICATION_CONTROLLER: &str = "class ApplicationController < ActionController::Base\nend\n";
 
+const MEMOIZABLE_CONCERN: &str = r#"module Memoizable
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def memoize(*method_names)
+      method_names.each do |method_name|
+        if instance_method(method_name).arity.nonzero?
+          raise UnsupportedMethod, "memoize takes no-arg methods only"
+        end
+
+        original_method = :"__non_memoized_#{method_name}"
+        memoized_method = :"__memoized_#{method_name}"
+
+        define_method(memoized_method) do
+          @__memo_cache ||= {}
+          @__memo_cache.fetch(method_name) { @__memo_cache[method_name] = send(original_method) }
+        end
+
+        alias_method original_method, method_name
+        alias_method method_name, memoized_method
+      end
+    end
+  end
+end
+"#;
+
 const PREPENDED_HELPER: &str = r#"module PrependedHelper
   def prepended_thing
     1
@@ -32,8 +62,9 @@ end
 "#;
 
 const WIDGETS_CONTROLLER: &str = r#"class WidgetsController < ApplicationController
+  include Memoizable
   prepend PrependedHelper
-  using PrependedHelper
+  using Memoizable
 
   before_action -> { ensure_guard }, only: [:show]
   before_action do
@@ -49,6 +80,8 @@ const WIDGETS_CONTROLLER: &str = r#"class WidgetsController < ApplicationControl
 
   K = 1
   private_constant :K
+
+  memoize :a
 
   helper FooHelper
 
@@ -72,6 +105,7 @@ fn tree() -> HashMap<PathBuf, Vec<u8>> {
     let files: Vec<(&str, &str)> = vec![
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),
+        ("app/controllers/concerns/memoizable.rb", MEMOIZABLE_CONCERN),
         ("app/controllers/concerns/prepended_helper.rb", PREPENDED_HELPER),
         ("app/controllers/widgets_controller.rb", WIDGETS_CONTROLLER),
         ("app/helpers/foo_helper.rb", FOO_HELPER),
@@ -141,9 +175,10 @@ fn prepend_makes_the_modules_own_methods_reachable() {
 }
 
 /// The survey report — activated across the WHOLE pipeline (ingest
-/// through lowering) — carries the specific line `using` earns and,
-/// crucially, NO generic "controller class-body macro not recognized"
-/// line for any of this file's shapes.
+/// through lowering) — carries the specific lines this file's shapes
+/// earn (`using`, `memoize`'s no-op classification) and, crucially,
+/// NO generic "controller class-body macro not recognized" line for
+/// any of them.
 #[test]
 fn the_survey_report_has_only_the_specific_lines_no_generic_unrecognized() {
     roundhouse::ingest::survey::activate();
@@ -154,13 +189,19 @@ fn the_survey_report_has_only_the_specific_lines_no_generic_unrecognized() {
     let messages: Vec<String> = gaps.iter().map(|g| format!("{g:?}")).collect();
 
     assert!(
-        messages
-            .iter()
-            .any(|m| m.contains("refinement activated") && m.contains("using PrependedHelper")),
+        messages.iter().any(|m| m.contains("refinement activated") && m.contains("using Memoizable")),
         "using must earn its own line naming the refinement: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("class-body macro wraps existing methods") && m.contains("memoize")),
+        "memoize must be classified as a method-wrapping no-op: {messages:?}"
     );
     assert!(
         !messages.iter().any(|m| m.contains("controller class-body macro not recognized")),
         "none of these shapes should fall to the generic bucket: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("class-body macro not expanded")),
+        "memoize must not ALSO get the generic not-expanded line: {messages:?}"
     );
 }
