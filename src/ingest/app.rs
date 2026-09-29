@@ -2389,6 +2389,56 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
 /// exist everywhere would be worse than not modeling them at all.
 const REFINEMENT_MACROS: &[&str] = &["using"];
 
+/// Every method name this walk actually ingested a body for, anywhere
+/// in the app — model methods, concern/library-class methods, and a
+/// controller's own actions (which, today, is also where a `def
+/// self.x` class method lands; see `expand_class_body_macros`'s
+/// `self_actions` doc comment). Used to tell "an app-defined macro
+/// this walk's shape-recognizers failed to place" apart from "a name
+/// nothing here defines" — the latter can only be a gem's or Rails'
+/// own DSL, since the app had to compile against SOMETHING.
+/// Rails/ActionController's own filter macros. A call to one of these
+/// reaching the generic bucket means the NAME is recognized but the
+/// particular SHAPE isn't (`protect_from_forgery with: :null_session`,
+/// say — `parse_forgery_macro` only models the `:exception` strategy) —
+/// roundhouse's own coverage gap, not evidence of a gem. Neither
+/// `all_defined_method_names` nor any `Gemfile.lock` will ever contain
+/// these (Rails itself is never "ingested" as app source), so without
+/// this exclusion every one of them would misfire the gem heuristic —
+/// exactly what happened to `protect_from_forgery` before this list
+/// existed, see the PR notes.
+const RAILS_CORE_FILTER_MACROS: &[&str] = &[
+    "before_action",
+    "after_action",
+    "around_action",
+    "skip_before_action",
+    "skip_around_action",
+    "skip_after_action",
+    "prepend_before_action",
+    "protect_from_forgery",
+    "skip_forgery_protection",
+];
+
+fn all_defined_method_names(app: &App) -> std::collections::HashSet<&str> {
+    let mut names = std::collections::HashSet::new();
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            names.insert(m.name.as_str());
+        }
+    }
+    for model in &app.models {
+        for m in model.methods() {
+            names.insert(m.name.as_str());
+        }
+    }
+    for c in &app.controllers {
+        for a in c.actions() {
+            names.insert(a.name.as_str());
+        }
+    }
+    names
+}
+
 /// A receiverless, blockless call left in a controller's class body
 /// after every consumer has run is a macro roundhouse does not
 /// recognize — `rate_limit`, say. Its effect (a guard, a filter, a
@@ -2403,6 +2453,14 @@ fn report_unrecognized_controller_macros(app: &App) {
     if !survey::is_active() {
         return;
     }
+    // Computed once per app rather than once per macro name: cheap
+    // relative to the walk itself, and every unrecognized call needs
+    // it to decide which of the three "not recognized" lines applies.
+    let defined_names = all_defined_method_names(app);
+    let unknown_gem_in_lock = app
+        .gem_lock
+        .as_ref()
+        .is_some_and(|lock| crate::gems::GemCensus::of(lock).unknown().next().is_some());
     for controller in &app.controllers {
         for item in &controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
@@ -2449,13 +2507,38 @@ fn report_unrecognized_controller_macros(app: &App) {
                 });
                 continue;
             }
-            survey::record(&IngestError::Unsupported {
-                file,
-                message: format!(
+            // Three ways a name can reach here, from most to least
+            // actionable. (1) It IS defined somewhere this walk
+            // ingested a body for — an app-defined macro whose SHAPE
+            // this analyzer doesn't recognize, the original generic
+            // bucket. (2) It is defined nowhere the walk looked, but
+            // the app's `Gemfile.lock` names at least one gem the
+            // census can't place (`procore-sift`'s `sort_on`, never
+            // ingested because gem sources aren't part of the walk) —
+            // by elimination, that is the more likely home, without
+            // claiming to know WHICH unknown gem. (3) Same "defined
+            // nowhere ingested" case with no gem_lock data at all, or
+            // none of its gems are Unknown to the census — the
+            // weakest, most honest claim available.
+            let message = if defined_names.contains(method.as_str())
+                || RAILS_CORE_FILTER_MACROS.contains(&method.as_str())
+            {
+                format!(
                     "controller class-body macro not recognized: `{}` (its effect is dropped from the output)",
                     method.as_str()
-                ),
-            });
+                )
+            } else if unknown_gem_in_lock {
+                format!(
+                    "controller class-body macro from an unmodeled gem: `{}`",
+                    method.as_str()
+                )
+            } else {
+                format!(
+                    "controller class-body macro not defined in the app: `{}` (a gem's DSL?)",
+                    method.as_str()
+                )
+            };
+            survey::record(&IngestError::Unsupported { file, message });
         }
     }
 }
@@ -2482,16 +2565,32 @@ fn report_unrecognized_controller_macros(app: &App) {
 /// :create]`, which every consumer of the chain already understands.
 /// Left unexpanded, campfire's sign-in page demanded sign-in.
 ///
-/// ALL-OR-NOTHING, and the reason is the failure direction, not
-/// tidiness. Dropping the whole macro fails CLOSED — a page asks for
-/// authentication it shouldn't. Expanding half of
-/// `require_unauthenticated_access` — taking its `skip_before_action`
-/// and losing the `before_action :restore_authentication,
-/// :redirect_signed_in_user_to_root` behind it — fails OPEN. So a macro
-/// whose body holds one statement this can't read stays Unknown, whole,
-/// and is recorded as a gap.
+/// PARTIAL EXPANSION, not all-or-nothing. An earlier version of this
+/// pass dropped a macro's ENTIRE body the moment one statement in it
+/// wasn't filter DSL, reasoning about failure direction: half-
+/// expanding `require_unauthenticated_access` — keeping its
+/// `skip_before_action` but losing the `before_action
+/// :restore_authentication, …` behind it — fails OPEN (a page that
+/// should redirect signed-in users away no longer does). That risk is
+/// about silently DROPPING a filter statement this pass DID recognize;
+/// it says nothing about a statement we never claimed to model in the
+/// first place. So the policy here is narrower and safer than either
+/// extreme: every filter statement `filter_from_send` recognizes is
+/// ALWAYS expanded, in every macro, regardless of what its neighboring
+/// statements are; a statement that turns out to be a class-level
+/// config write (`configuration.policy_class = policy_class`) or
+/// something else entirely is never silently absorbed into that
+/// success — it earns its own ledger line (`class-body macro config
+/// not modeled` for the former, the original "holds a statement that
+/// is not filter DSL" for the latter, now naming the specific
+/// statement instead of indicting the whole macro). Procore's
+/// `permit_with` is exactly this shape: `_permissions.permit_with(...)`
+/// (a config write) followed by `around_action(:enforce_action_policy,
+/// unless: :skip_policy_enforcement?)` (real filter DSL) — the old
+/// policy dropped the around_action entirely; this expands it and
+/// notes the config write quietly instead.
 fn expand_class_body_macros(app: &mut App) {
-    use crate::dialect::{ControllerBodyItem, MethodReceiver};
+    use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::expr::ExprNode;
 
     // Class-side methods of every module, by name — the macro table.
@@ -2509,9 +2608,6 @@ fn expand_class_body_macros(app: &mut App) {
             macros.insert(lc.name.clone(), class_side);
         }
     }
-    if macros.is_empty() {
-        return;
-    }
 
     // Includes reachable from each controller, ITS ANCESTORS INCLUDED:
     // campfire's SessionsController includes nothing itself and calls a
@@ -2519,8 +2615,12 @@ fn expand_class_body_macros(app: &mut App) {
     // normal arrangement — the base controller mixes the concern in and
     // the subclasses use what it gave them.
     let mut reachable: HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> = HashMap::new();
+    // Each controller's own ancestor chain (itself first, then
+    // parents) — see `self_actions` below for what this feeds.
+    let mut self_chain: HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> = HashMap::new();
     for controller in &app.controllers {
         let mut acc: Vec<crate::ident::ClassId> = Vec::new();
+        let mut ancestors: Vec<crate::ident::ClassId> = Vec::new();
         let mut cur = Some(controller);
         let mut seen: std::collections::BTreeSet<crate::ident::ClassId> =
             std::collections::BTreeSet::new();
@@ -2528,6 +2628,7 @@ fn expand_class_body_macros(app: &mut App) {
             if !seen.insert(c.name.clone()) {
                 break;
             }
+            ancestors.push(c.name.clone());
             for inc in crate::analyze::controller_includes(c) {
                 if !acc.contains(&inc) {
                     acc.push(inc);
@@ -2539,11 +2640,45 @@ fn expand_class_body_macros(app: &mut App) {
                 .and_then(|p| app.controllers.iter().find(|o| &o.name == p));
         }
         reachable.insert(controller.name.clone(), acc);
+        self_chain.insert(controller.name.clone(), ancestors);
+    }
+
+    // A controller's OWN `def self.foo` — a macro-of-macros a base
+    // controller defines directly rather than exporting through a
+    // concern (`daily_log`'s `authorize_daily_log_actions!`, which
+    // calls `permit_with` then `authorize` three times in turn).
+    // Roundhouse's controller ingest does not yet distinguish a class
+    // method from an instance one (`ingest_controller_body_item` never
+    // reads `def.receiver()`, so `def self.x` and `def x` both land as
+    // `Action`), so this table is keyed on NAME ALONE across every
+    // `Action` in a controller's own body — broader than "just the
+    // class methods." That is safe here specifically because of WHERE
+    // this table gets consulted: only for a receiverless call sitting
+    // directly in ANOTHER class's body, never inside a `def`. Real
+    // Ruby can only resolve that call against something callable on
+    // the class ITSELF (`self` at class-body scope is the class
+    // object) — a plain instance method could never be reached this
+    // way, so a same-named instance method elsewhere simply never
+    // matches a real call site here. No parameter substitution is
+    // attempted (`authorize_daily_log_actions!` and its like are
+    // niladic bang-methods in every case this pass has seen); a call
+    // with arguments falls through to the ordinary "not recognized"
+    // handling instead of guessing a binding.
+    let self_actions: HashMap<crate::ident::ClassId, HashMap<Symbol, crate::expr::Expr>> = app
+        .controllers
+        .iter()
+        .map(|c| (c.name.clone(), c.actions().map(|a| (a.name.clone(), a.body.clone())).collect()))
+        .collect();
+
+    if macros.is_empty() && self_actions.values().all(|m| m.is_empty()) {
+        return;
     }
 
     for controller in &mut app.controllers {
         let includes = reachable.get(&controller.name).cloned().unwrap_or_default();
-        if includes.is_empty() {
+        let ancestors = self_chain.get(&controller.name).cloned().unwrap_or_default();
+        if includes.is_empty() && ancestors.iter().all(|a| self_actions.get(a).is_none_or(HashMap::is_empty))
+        {
             continue;
         }
         let mut expanded: Vec<ControllerBodyItem> = Vec::new();
@@ -2553,75 +2688,476 @@ fn expand_class_body_macros(app: &mut App) {
                 expanded.push(item);
                 continue;
             };
-            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
+            let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
                 expanded.push(item);
                 continue;
             };
             // The macro has to come from a module this controller
-            // includes; a same-named method elsewhere is not it.
+            // includes (a same-named method elsewhere is not it), or —
+            // failing that, and only for a bare call with no arguments
+            // or block — from the controller's own ancestor chain (see
+            // `self_actions` above).
+            let found = includes
+                .iter()
+                .find_map(|inc| {
+                    macros
+                        .get(inc)
+                        .and_then(|ms| ms.iter().find(|m| &m.name == method))
+                        .map(|m| MacroSource::Concern(inc.clone(), m.clone()))
+                })
+                .or_else(|| {
+                    if !args.is_empty() || block.is_some() {
+                        return None;
+                    }
+                    ancestors.iter().find_map(|anc| {
+                        self_actions
+                            .get(anc)
+                            .and_then(|m| m.get(method))
+                            .map(|body| MacroSource::SelfMacro(anc.clone(), body.clone()))
+                    })
+                });
+            let Some(found) = found else {
+                expanded.push(item);
+                continue;
+            };
+
+            // Item 2: the call carries a block AND the concern's own
+            // macro declares a block parameter to store it in —
+            // `authorize(:create, :update) { loader }`. The block runs
+            // via `instance_exec` on the controller at some later,
+            // action-specific point this pass does not model, so it is
+            // typed as controller-instance code and left OUT of the
+            // filter chain rather than silently dropped or claimed as
+            // a filter it is not.
+            if let Some(blk) = block {
+                let macro_def = match &found {
+                    MacroSource::Concern(_, m) => Some(m),
+                    MacroSource::SelfMacro(..) => None,
+                };
+                if macro_def.is_some_and(|m| m.block_param.is_some()) {
+                    match block_literal_body(blk) {
+                        Some(block_body) => push_block_helper(
+                            &mut expanded,
+                            &controller.name,
+                            method,
+                            block_body,
+                        ),
+                        None => {
+                            survey::record(&IngestError::Unsupported {
+                                file: controller.name.0.as_str().to_string(),
+                                message: format!(
+                                    "class-body macro not expanded: `{}` holds a block whose shape is not recognized",
+                                    method.as_str()
+                                ),
+                            });
+                            expanded.push(item);
+                        }
+                    }
+                } else {
+                    survey::record(&IngestError::Unsupported {
+                        file: controller.name.0.as_str().to_string(),
+                        message: format!(
+                            "class-body macro not expanded: `{}` holds a block its definition does not accept",
+                            method.as_str()
+                        ),
+                    });
+                    expanded.push(item);
+                }
+                continue;
+            }
+
+            let (module, body) = match found {
+                MacroSource::Concern(module, macro_def) => {
+                    (module, substitute_params(&macro_def, args))
+                }
+                MacroSource::SelfMacro(module, body) => (module, body),
+            };
+            let mut expansion = MacroBodyExpansion::default();
+            classify_macro_body(&body, &module, &includes, &macros, MAX_MACRO_NESTING, &mut expansion);
+
+            if expansion.wrap_noop {
+                survey::record(&IngestError::Unsupported {
+                    file: controller.name.0.as_str().to_string(),
+                    message: format!(
+                        "class-body macro wraps existing methods: `{}` from {} (treated as a no-op)",
+                        method.as_str(),
+                        module.0.as_str()
+                    ),
+                });
+            }
+            if !expansion.config_notes.is_empty() {
+                survey::record(&IngestError::Unsupported {
+                    file: controller.name.0.as_str().to_string(),
+                    message: format!(
+                        "class-body macro config not modeled: `{}` {}",
+                        method.as_str(),
+                        expansion.config_notes.join("; ")
+                    ),
+                });
+            }
+            let mut seen_unmodeled: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for kind in &expansion.unmodeled {
+                if !seen_unmodeled.insert(kind.clone()) {
+                    continue;
+                }
+                survey::record(&IngestError::Unsupported {
+                    file: controller.name.0.as_str().to_string(),
+                    message: format!(
+                        "class-body macro not expanded: `{}` from {} holds a statement that is not filter DSL: {}",
+                        method.as_str(),
+                        module.0.as_str(),
+                        kind
+                    ),
+                });
+            }
+            for (block_method, block_body) in expansion.block_helpers {
+                push_block_helper(&mut expanded, &controller.name, &block_method, block_body);
+            }
+
+            if expansion.filters.is_empty() {
+                expanded.push(item);
+            } else {
+                let mut comments = leading_comments.clone();
+                let mut blank = *leading_blank_line;
+                for filter in expansion.filters {
+                    expanded.push(ControllerBodyItem::Filter {
+                        filter,
+                        leading_comments: std::mem::take(&mut comments),
+                        leading_blank_line: std::mem::take(&mut blank),
+                    });
+                }
+            }
+        }
+        controller.body = expanded;
+    }
+
+    /// Synthesize the private, unreachable-from-dispatch helper a
+    /// block-registering macro's block becomes (item 2): a
+    /// `PrivateMarker` followed by an `Action` whose body is the
+    /// block's, under a sentinel name no route or `authorize_action`
+    /// scan can collide with. The analyzer types its body in
+    /// controller-instance context like any other private method
+    /// (`controller.actions()` does not distinguish), so a receiverless
+    /// call inside it that fails to resolve surfaces honestly — but it
+    /// is never added to the filter chain and never called from
+    /// anywhere in the emitted program, so its `@ivar` writes are never
+    /// seeded into a view (`view_name_for_action` only seeds a view
+    /// whose file actually exists, and no view is ever named after a
+    /// sentinel).
+    fn push_block_helper(
+        expanded: &mut Vec<ControllerBodyItem>,
+        controller_name: &crate::ident::ClassId,
+        method: &Symbol,
+        block_body: crate::expr::Expr,
+    ) {
+        survey::record(&IngestError::Unsupported {
+            file: controller_name.0.as_str().to_string(),
+            message: format!(
+                "class-body macro block not sequenced: `{}` (typed as controller code, not placed in the filter chain)",
+                method.as_str()
+            ),
+        });
+        expanded.push(ControllerBodyItem::PrivateMarker {
+            leading_comments: Vec::new(),
+            leading_blank_line: false,
+        });
+        let sentinel = Symbol::from(format!("__{}_block_{}__", method.as_str(), expanded.len()));
+        expanded.push(ControllerBodyItem::Action {
+            action: Action {
+                name: sentinel,
+                params: crate::ty::Row::closed(),
+                opt_params: Vec::new(),
+                kw_params: Vec::new(),
+                kwrest_param: None,
+                block_param: None,
+                name_span: crate::span::Span::synthetic(),
+                body: block_body,
+                renders: RenderTarget::Inferred,
+                effects: crate::effect::EffectSet::pure(),
+            },
+            leading_comments: Vec::new(),
+            leading_blank_line: false,
+        });
+    }
+}
+
+/// Where a class-body macro call's definition came from, for the
+/// lookup `expand_class_body_macros` does before deciding how (or
+/// whether) to expand it.
+enum MacroSource {
+    /// A concern's `class_methods do` method, reached through an
+    /// `include`. Carries its own `MethodDef` so the call's arguments
+    /// can be bound to its parameters (`substitute_params`).
+    Concern(crate::ident::ClassId, crate::dialect::MethodDef),
+    /// A plain Ruby class method defined directly on the calling
+    /// controller or an ancestor (`self_actions`). No parameter
+    /// substitution — only a bare, argument-less call reaches this
+    /// variant at all (see the lookup site).
+    SelfMacro(crate::ident::ClassId, crate::expr::Expr),
+}
+
+/// Every statement a substituted macro body (or a self-macro's body,
+/// substitution-free) resolves to, sorted into five buckets. Where the
+/// single-purpose `filters_from_macro_body` this supersedes returned
+/// `None` the instant one statement wasn't filter DSL — vetoing every
+/// filter in the body along with it — this classifies each statement
+/// independently, so the filter half of a mixed body (the half that
+/// actually shapes the dispatch chain) is never held hostage by a
+/// config write or a truly-unmodeled statement next to it.
+#[derive(Default)]
+struct MacroBodyExpansion {
+    filters: Vec<crate::dialect::Filter>,
+    /// One description per statement recognized as a class-level
+    /// config write (`describe_config_write`) — reported together as
+    /// a single quiet ledger line per macro call.
+    config_notes: Vec<String>,
+    /// One label per statement that is neither filter DSL nor a
+    /// recognized config write — each earns its own ledger line,
+    /// deduplicated by the caller.
+    unmodeled: Vec<String>,
+    /// `(macro name, block body)` pairs for a NESTED block-registering
+    /// macro call found while walking a macro-of-macros body (item 2,
+    /// one level down — e.g. `authorize_daily_log_actions!` calling
+    /// `authorize(:create) { … }` itself).
+    block_helpers: Vec<(Symbol, crate::expr::Expr)>,
+    /// Set when at least one statement is a method-wrapping no-op
+    /// (`is_method_wrapping_noop` — `memoize`, `instrument_methods`):
+    /// redefines an EXISTING method in place rather than adding to the
+    /// class's visible surface. Reported once per macro call, under
+    /// its own quieter ledger line, instead of feeding the generic
+    /// "not expanded" bucket.
+    wrap_noop: bool,
+}
+
+/// How many additional levels of "this statement is itself a call to
+/// another macro this controller can reach" `classify_macro_statement`
+/// will follow before giving up and calling an unresolved nested call
+/// unmodeled. `1` covers the macro-of-macros shape this pass targets
+/// (`authorize_daily_log_actions!` calling `permit_with`/`authorize`,
+/// each one level below the self-macro body) without an unbounded
+/// walk chasing macros that call macros that call macros.
+const MAX_MACRO_NESTING: u32 = 1;
+
+/// Classify every top-level statement in a macro body (flattening a
+/// `Seq`, matching `filters_from_macro_body`'s old traversal) into
+/// `out`.
+fn classify_macro_body(
+    body: &crate::expr::Expr,
+    module: &crate::ident::ClassId,
+    includes: &[crate::ident::ClassId],
+    macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    depth: u32,
+    out: &mut MacroBodyExpansion,
+) {
+    use crate::expr::ExprNode;
+    let statements: Vec<&crate::expr::Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    for stmt in statements {
+        classify_macro_statement(stmt, module, includes, macros, depth, out);
+    }
+}
+
+/// Classify one statement: filter DSL first (`filter_from_send`);
+/// then, while `depth` allows it, a nested call to another macro this
+/// same controller can reach (recurses one level, or synthesizes a
+/// block helper exactly as the top-level call site would); then a
+/// recognized class-level config write; anything else is unmodeled,
+/// named by kind.
+fn classify_macro_statement(
+    stmt: &crate::expr::Expr,
+    module: &crate::ident::ClassId,
+    includes: &[crate::ident::ClassId],
+    macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    depth: u32,
+    out: &mut MacroBodyExpansion,
+) {
+    use crate::expr::ExprNode;
+
+    if let Some(filters) = filter_from_send(stmt, module) {
+        out.filters.extend(filters);
+        return;
+    }
+    if depth > 0 {
+        if let ExprNode::Send { recv: None, method, args, block, .. } = &*stmt.node {
             let found = includes.iter().find_map(|inc| {
                 macros
                     .get(inc)
                     .and_then(|ms| ms.iter().find(|m| &m.name == method))
                     .map(|m| (inc.clone(), m.clone()))
             });
-            let Some((module, macro_def)) = found else {
-                expanded.push(item);
-                continue;
-            };
-            let body = substitute_params(&macro_def, args);
-            match filters_from_macro_body(&body, &module) {
-                Some(filters) => {
-                    let mut comments = leading_comments.clone();
-                    let mut blank = *leading_blank_line;
-                    for filter in filters {
-                        expanded.push(ControllerBodyItem::Filter {
-                            filter,
-                            leading_comments: std::mem::take(&mut comments),
-                            leading_blank_line: std::mem::take(&mut blank),
-                        });
+            if let Some((nested_module, macro_def)) = found {
+                if let Some(blk) = block {
+                    if macro_def.block_param.is_some() {
+                        match block_literal_body(blk) {
+                            Some(block_body) => out.block_helpers.push((method.clone(), block_body)),
+                            None => out.unmodeled.push(format!(
+                                "`{}` (block shape not recognized)",
+                                method.as_str()
+                            )),
+                        }
+                    } else {
+                        out.unmodeled.push(format!(
+                            "`{}` (called with a block it does not accept)",
+                            method.as_str()
+                        ));
                     }
+                    return;
                 }
-                None if is_method_wrapping_noop(&body) => {
-                    // `memoize :y` (Procore's `Memoizer`), `instrument_methods
-                    // :a, :b` (`procore-instrumentation`) — a concern-exported
-                    // macro whose whole body redefines an EXISTING method in
-                    // place (`alias_method`, `define_method`, `prepend` of an
-                    // anonymous wrapper module, `class_eval`) rather than
-                    // adding to the class's visible surface. Roundhouse
-                    // doesn't model the wrap (the wrapped method still runs
-                    // unwrapped in the emitted program), but that's a
-                    // narrower, quieter gap than "not expanded" implies —
-                    // filter DSL was never the shape here — so it gets its
-                    // own line instead of the generic one, and is dropped
-                    // rather than round-tripped: nothing replays a
-                    // controller's `Unknown` items today (see
-                    // `lower_controller_to_library_class`), so keeping it
-                    // would only feed the generic ledger a second time via
-                    // `report_unrecognized_controller_macros`.
-                    survey::record(&IngestError::Unsupported {
-                        file: format!("{}", controller.name.0.as_str()),
-                        message: format!(
-                            "class-body macro wraps existing methods: `{}` from {} (treated as a no-op)",
-                            method.as_str(),
-                            module.0.as_str()
-                        ),
-                    });
-                }
-                None => {
-                    survey::record(&IngestError::Unsupported {
-                        file: format!("{}", controller.name.0.as_str()),
-                        message: format!(
-                            "class-body macro not expanded: `{}` from {} holds a statement that is not filter DSL",
-                            method.as_str(),
-                            module.0.as_str()
-                        ),
-                    });
-                    expanded.push(item);
-                }
+                let nested_body = substitute_params(&macro_def, args);
+                classify_macro_body(&nested_body, &nested_module, includes, macros, depth - 1, out);
+                return;
             }
         }
-        controller.body = expanded;
+    }
+    if is_method_wrapping_noop(stmt) {
+        // `memoize :y` (Procore's `Memoizer`), `instrument_methods :a,
+        // :b` (`procore-instrumentation`) — a concern-exported macro
+        // whose whole body redefines an EXISTING method in place
+        // (`alias_method`, `define_method`, `prepend` of an anonymous
+        // wrapper module, `class_eval`) rather than adding to the
+        // class's visible surface. Roundhouse doesn't model the wrap
+        // (the wrapped method still runs unwrapped in the emitted
+        // program), but that's a narrower, quieter gap than "not
+        // expanded" implies — filter DSL was never the shape here —
+        // so it's flagged for its own quiet ledger line (by the
+        // caller, once per macro call) instead of feeding the generic
+        // `unmodeled` bucket.
+        out.wrap_noop = true;
+        return;
+    }
+    if let Some(note) = describe_config_write(stmt) {
+        out.config_notes.push(note);
+        return;
+    }
+    out.unmodeled.push(statement_kind_label(stmt));
+}
+
+/// The block literal attached to a call (`{ … }` / `do … end`) — ingest
+/// always lowers this shape to `ExprNode::Lambda` directly (as opposed
+/// to `lambda { }`/`proc { }` passed as an ARGUMENT, which nests one
+/// level deeper — not needed here since we only ever read a call's own
+/// attached block).
+fn block_literal_body(block_expr: &crate::expr::Expr) -> Option<crate::expr::Expr> {
+    match &*block_expr.node {
+        crate::expr::ExprNode::Lambda { body, .. } => Some(body.clone()),
+        _ => None,
+    }
+}
+
+/// Best-effort recognition of a class-body statement that writes
+/// class-level state without itself being filter DSL — the CONFIG half
+/// of a partially-expandable macro. Deliberately not exhaustive: a
+/// config write this misses falls through to the unmodeled bucket
+/// instead, which is the safe default (informative, no coverage
+/// claim).
+fn describe_config_write(stmt: &crate::expr::Expr) -> Option<String> {
+    use crate::expr::{ExprNode, LValue};
+
+    // `configuration.policy_class = policy_class` / `self.x = y` — a
+    // plain `=` on an explicit receiver is ordinary Ruby method-call
+    // sugar (`policy_class=(policy_class)`), so ingest represents it as
+    // a `Send` whose method NAME carries the trailing `=`, not as an
+    // `Assign` with an `LValue::Attr` target (that shape is reserved
+    // for the compound forms below, where the read half matters too).
+    // Comparison operators (`==`, `!=`, `<=`, `>=`, `===`) also end in
+    // `=` and must not be mistaken for setters.
+    fn is_setter_name(method: &str) -> bool {
+        method.ends_with('=') && !matches!(method, "==" | "!=" | "<=" | ">=" | "===")
+    }
+
+    match &*stmt.node {
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if is_setter_name(method.as_str()) && args.len() == 1 =>
+        {
+            Some(format!(
+                "stores `{}` on {}",
+                method.as_str().trim_end_matches('='),
+                describe_receiver(recv)
+            ))
+        }
+        // `@_x[key] = value` — Prism DOES give `[]=` its own write node
+        // (unlike the plain-attribute case above), landing here as
+        // `Assign` with an `LValue::Index` target.
+        ExprNode::Assign { target: LValue::Index { recv, .. }, .. } => {
+            Some(format!("stores a value in {}", describe_receiver(recv)))
+        }
+        ExprNode::OpAssign { target: LValue::Attr { recv, name }, .. } => {
+            Some(format!("updates `{}` on {}", name.as_str(), describe_receiver(recv)))
+        }
+        ExprNode::OpAssign { target: LValue::Index { recv, .. }, .. } => {
+            Some(format!("updates a value in {}", describe_receiver(recv)))
+        }
+        // `class_attribute :x`, `cattr_accessor :x`, `mattr_writer :x`
+        // — receiverless declarations of class-level attributes.
+        ExprNode::Send { recv: None, method, block: None, .. }
+            if matches!(
+                method.as_str(),
+                "class_attribute" | "cattr_accessor" | "cattr_writer" | "mattr_accessor" | "mattr_writer"
+            ) =>
+        {
+            Some(format!("declares a class attribute via `{}`", method.as_str()))
+        }
+        // `@_x << value` / `@_x.push(value)` — mutates an ivar-held
+        // collection in place.
+        ExprNode::Send { recv: Some(recv), method, block: None, .. }
+            if matches!(&*recv.node, ExprNode::Ivar { .. })
+                && matches!(method.as_str(), "<<" | "push" | "concat" | "merge!") =>
+        {
+            Some(format!("mutates {}", describe_receiver(recv)))
+        }
+        // `_permissions.permit_with(...)` — a call forwarded to a
+        // memoized class-level accessor, the call-site shape a
+        // `@_x ||= X.new` reader takes (the receiver is itself a bare,
+        // argument-less, blockless call). Not a setter, but the same
+        // "hand the argument to class-level state and keep no result"
+        // idiom `permit_with`'s real body uses. Checked LAST: it is
+        // the widest match here (any blockless call on a bare-call
+        // receiver), so every more specific shape above gets first
+        // refusal.
+        ExprNode::Send { recv: Some(recv), block: None, .. }
+            if matches!(
+                &*recv.node,
+                ExprNode::Send { recv: None, args, block: None, .. } if args.is_empty()
+            ) =>
+        {
+            Some(format!("forwards to {}", describe_receiver(recv)))
+        }
+        _ => None,
+    }
+}
+
+/// A short, human-readable name for a config write's receiver, for the
+/// ledger message.
+fn describe_receiver(expr: &crate::expr::Expr) -> String {
+    use crate::expr::ExprNode;
+    match &*expr.node {
+        ExprNode::SelfRef => "self".to_string(),
+        ExprNode::Ivar { name } => format!("@{}", name.as_str()),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            format!("`{}`", method.as_str())
+        }
+        ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+        _ => "an object".to_string(),
+    }
+}
+
+/// A short, grep-able label for a statement that is neither filter DSL
+/// nor a recognized config write — named by its own shape rather than
+/// the generic "a statement" the old all-or-nothing message used.
+fn statement_kind_label(stmt: &crate::expr::Expr) -> String {
+    use crate::expr::ExprNode;
+    match &*stmt.node {
+        ExprNode::Send { recv: None, method, .. } => format!("`{}`", method.as_str()),
+        ExprNode::Send { recv: Some(_), method, .. } => format!("`.{}`", method.as_str()),
+        ExprNode::Assign { .. } => "an assignment".to_string(),
+        ExprNode::OpAssign { .. } => "a compound assignment".to_string(),
+        ExprNode::If { .. } => "a conditional".to_string(),
+        ExprNode::Raise { .. } => "a `raise`".to_string(),
+        ExprNode::Case { .. } => "a `case`".to_string(),
+        other => format!("a `{}`", other.kind_str()),
     }
 }
 
@@ -2717,8 +3253,8 @@ fn is_method_wrapping_noop(body: &crate::expr::Expr) -> bool {
 /// straight variable replacement.
 ///
 /// A parameter the call site does NOT supply still has to bind, or the
-/// body keeps a free variable and `filters_from_macro_body` rejects the
-/// whole macro — which is how the bare `allow_unauthenticated_access`
+/// body keeps a free variable that resolves to nothing recognizable —
+/// which is how the bare `allow_unauthenticated_access`
 /// (no arguments at all, campfire's FirstRunsController) silently kept
 /// `require_authentication` and made `/first_run` redirect to
 /// `/session/new`, which redirects back.
@@ -2776,26 +3312,14 @@ fn substitute_params(
     body
 }
 
-/// Every filter the macro body declares, or None if any statement in it
-/// is something else. The IR twin of `parse_filter_call`, which reads
-/// prism nodes — by this point the concern's body is already lowered.
-fn filters_from_macro_body(
-    body: &crate::expr::Expr,
-    module: &crate::ident::ClassId,
-) -> Option<Vec<crate::dialect::Filter>> {
-    use crate::expr::ExprNode;
-
-    let mut out = Vec::new();
-    let statements: Vec<&crate::expr::Expr> = match &*body.node {
-        ExprNode::Seq { exprs } => exprs.iter().collect(),
-        _ => vec![body],
-    };
-    for stmt in statements {
-        out.extend(filter_from_send(stmt, module)?);
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
+/// Recognize ONE statement as filter DSL, or `None` if it is something
+/// else — the IR twin of `parse_filter_call`, which reads prism nodes
+/// (by this point the concern's body is already lowered). Called once
+/// per statement by `classify_macro_statement`, which is what actually
+/// walks a macro body; a whole-body `None`-on-first-miss walker used
+/// to live here (`filters_from_macro_body`) but was replaced by the
+/// per-statement classifier — see `expand_class_body_macros`'s
+/// "PARTIAL EXPANSION" doc comment for why.
 fn filter_from_send(
     expr: &crate::expr::Expr,
     module: &crate::ident::ClassId,
@@ -2830,6 +3354,17 @@ fn filter_from_send(
     let mut targets: Vec<(crate::ident::Symbol, crate::span::Span)> = Vec::new();
     let mut only: Vec<crate::ident::Symbol> = Vec::new();
     let mut except: Vec<crate::ident::Symbol> = Vec::new();
+    // Symbol-form `if:`/`unless:` on a macro-expanded filter resolve
+    // fine at runtime: the guard predicate the macro names is defined
+    // in the SAME concern (`skip_policy_enforcement?` beside
+    // `permit_with`), which Ruby's `include` mixes onto the controller
+    // exactly like the filter target itself — no different from an
+    // ordinary `before_action :x, if: :pred` written directly in the
+    // controller. A lambda/proc-form guard is a separate, harder case
+    // (its body would need re-substitution against the CALL site, not
+    // the macro's own params) and still refuses the whole statement.
+    let mut if_cond: Option<crate::ident::Symbol> = None;
+    let mut unless_cond: Option<crate::ident::Symbol> = None;
     for arg in args {
         if let Some(sym) = sym_of(arg) {
             targets.push((sym, arg.span));
@@ -2845,11 +3380,14 @@ fn filter_from_send(
             match sym_of(key).as_ref().map(|k| k.as_str().to_string()).as_deref() {
                 Some("only") => only = sym_list(value),
                 Some("except") => except = sym_list(value),
-                // if:/unless: guards on a macro-expanded filter would
-                // need the predicate to resolve in the INCLUDER; not
-                // modeled, and silently dropping a guard changes when a
-                // filter fires.
-                Some("if") | Some("unless") => return None,
+                Some("if") => {
+                    let Some(sym) = sym_of(value) else { return None };
+                    if_cond = Some(sym);
+                }
+                Some("unless") => {
+                    let Some(sym) = sym_of(value) else { return None };
+                    unless_cond = Some(sym);
+                }
                 _ => {}
             }
         }
@@ -2869,8 +3407,8 @@ fn filter_from_send(
                 except: except.clone(),
                 only_style: crate::expr::ArrayStyle::default(),
                 except_style: crate::expr::ArrayStyle::default(),
-                if_cond: None,
-                unless_cond: None,
+                if_cond: if_cond.clone(),
+                unless_cond: unless_cond.clone(),
                 if_cond_expr: None,
                 unless_cond_expr: None,
                 block: None,
