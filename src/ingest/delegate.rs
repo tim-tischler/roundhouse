@@ -232,7 +232,13 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
         if defines(&d.name) {
             continue;
         }
-        let (t, m) = (d.target.as_str(), d.method.as_str());
+        // `delegate :type, to: :class` — Rails' own body reads
+        // `self.class.type`; a bare `class.type` is the keyword, and
+        // the synthesized source failed to parse (roundhouse#F34 on
+        // Procore: 20 classes). Ruby has no other keyword that can be
+        // a delegate target, so `class` is the one spelling to fix.
+        let target_src = if d.target.as_str() == "class" { "self.class" } else { d.target.as_str() };
+        let (t, m) = (target_src, d.method.as_str());
         if let Some(setter) = m.strip_suffix('=') {
             // Rails forwards a setter with the one argument its own
             // `def name=(arg)` shape always takes — `delegate :name=`
@@ -312,6 +318,19 @@ mod tests {
             .find(|m| m.name.as_str() == "behavior=")
             .expect("setter should be synthesized");
         assert_eq!(setter.params.len(), 1, "a setter forwarder takes exactly the one argument Ruby's own assignment syntax supplies");
+    }
+
+    #[test]
+    fn a_delegate_to_class_reads_self_class() {
+        let mut lc = library_class(
+            "class Sorter\n  delegate :type, to: :class\nend\n",
+        );
+        let delegates = take_delegate_decls(&mut lc);
+        assert_eq!(delegates.len(), 1);
+        let src = synthesized_source(&lc, &delegates);
+        assert!(src.contains("self.class.type"), "target `class` must be spelled `self.class`:\n{src}");
+        let methods = synthesized_methods(&lc, &delegates);
+        assert!(methods.iter().any(|m| m.name.as_str() == "type"));
     }
 
     #[test]
