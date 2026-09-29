@@ -1396,3 +1396,89 @@ fn block_arg_ivar_and_call_result_have_specific_ledger_messages() {
         "block argument is a call result"
     );
 }
+
+// ── Gap F7: `...` argument forwarding ──
+
+#[test]
+fn forwarding_def_desugars_to_rest_kwrest_block_param() {
+    use roundhouse::ingest::ingest_app_from_tree;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let files: &[(&str, &str)] = &[(
+        "app/lib/sticky_filter_like.rb",
+        concat!(
+            "class StickyFilterLike\n",
+            "  def save(...)\n",
+            "    super(...)\n",
+            "  end\n",
+            "end\n",
+        ),
+    )];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.iter().map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec())).collect();
+
+    let app = ingest_app_from_tree(tree).expect("forwarding def/super ingest strict");
+    let lc = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "StickyFilterLike")
+        .expect("StickyFilterLike should be a library class");
+    let save = lc.methods.iter().find(|m| m.name.as_str() == "save").expect("save present");
+
+    assert_eq!(save.params.len(), 2, "expected *rest, **kwrest, got {:?}", save.params);
+    assert!(save.params[0].rest && !save.params[0].keyword, "params[0] should be *rest");
+    assert!(save.params[1].rest && save.params[1].keyword, "params[1] should be **kwrest");
+    assert_eq!(
+        save.block_param.as_ref().map(|p| p.name.as_str()),
+        Some("__fwd_blk"),
+        "`...` forwards the block too"
+    );
+
+    let ExprNode::Super { args: Some(args) } = &*save.body.node else {
+        panic!("expected Super, got {:?}", save.body.node);
+    };
+    assert_eq!(args.len(), 2, "super(...) should expand to [*rest, kwrest]");
+    assert!(matches!(&*args[0].node, ExprNode::Splat { .. }), "args[0] should be a Splat");
+    assert!(matches!(&*args[1].node, ExprNode::Var { .. }), "args[1] should be the kwrest Var");
+}
+
+#[test]
+fn forwarding_call_desugars_and_forwards_block() {
+    use roundhouse::ingest::ingest_app_from_tree;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let files: &[(&str, &str)] = &[(
+        "app/lib/service_wrapper.rb",
+        concat!(
+            "class ServiceWrapper\n",
+            "  def call(...)\n",
+            "    Inner.call(...)\n",
+            "  end\n",
+            "end\n",
+        ),
+    )];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.iter().map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec())).collect();
+
+    let app = ingest_app_from_tree(tree).expect("forwarding call ingest strict");
+    let lc = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "ServiceWrapper")
+        .expect("ServiceWrapper should be a library class");
+    let call = lc.methods.iter().find(|m| m.name.as_str() == "call").expect("call present");
+
+    let ExprNode::Send { args, block, .. } = &*call.body.node else {
+        panic!("expected Send, got {:?}", call.body.node);
+    };
+    assert_eq!(args.len(), 2, "Inner.call(...) should expand to [*rest, kwrest]");
+    assert!(matches!(&*args[0].node, ExprNode::Splat { .. }));
+    assert!(matches!(&*args[1].node, ExprNode::Var { .. }));
+    let Some(block) = block else { panic!("`...` should forward the block") };
+    match &*block.node {
+        ExprNode::Var { name, .. } => assert_eq!(name.as_str(), "__fwd_blk"),
+        other => panic!("expected Var(__fwd_blk), got {other:?}"),
+    }
+}

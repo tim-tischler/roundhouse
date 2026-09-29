@@ -293,13 +293,10 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_call_node().is_some() => {
             let c = n.as_call_node().unwrap();
             let method = constant_id_str(&c.name()).to_string();
-            let args: Vec<Expr> = if let Some(a) = c.arguments() {
-                a.arguments()
-                    .iter()
-                    .map(|arg| ingest_expr(&arg, file))
-                    .collect::<IngestResult<_>>()?
+            let (args, forwards_block): (Vec<Expr>, bool) = if let Some(a) = c.arguments() {
+                ingest_forwardable_arguments(&a, file)?
             } else {
-                vec![]
+                (vec![], false)
             };
             let recv = match c.receiver() {
                 Some(r) => Some(ingest_expr(&r, file)?),
@@ -307,6 +304,15 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             let block = match c.block() {
                 Some(block_node) => ingest_call_block(&block_node, file, &method)?,
+                // `y(...)` — no literal block, but `...` forwards the
+                // enclosing method's block too. `ingest_forwardable_arguments`
+                // read the same `ForwardingArgumentsNode` this flag comes
+                // from; reference the synthesized `__fwd_blk` binding
+                // `ingest_library_method` seeds for a forwarding `def`.
+                None if forwards_block => Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("__fwd_blk") },
+                )),
                 None => None,
             };
             // Two shapes a paren-less call can't hold once lowered, both
@@ -1262,14 +1268,15 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             ExprNode::Super { args: None }
         }
         n if n.as_super_node().is_some() => {
-            // `super(args)` / `super()` — args = Some(vec).
+            // `super(args)` / `super()` — args = Some(vec). `super(...)`
+            // expands the same way a plain call's `...` does (see
+            // `ingest_forwardable_arguments`); the forwarded BLOCK needs
+            // no handling here — `ExprNode::Super` has no block slot at
+            // all, because Ruby's `super` always forwards the enclosing
+            // method's block implicitly, with or without `...`.
             let s = n.as_super_node().unwrap();
             let args = match s.arguments() {
-                Some(a) => a
-                    .arguments()
-                    .iter()
-                    .map(|arg| ingest_expr(&arg, file))
-                    .collect::<IngestResult<Vec<_>>>()?,
+                Some(a) => ingest_forwardable_arguments(&a, file)?.0,
                 None => vec![],
             };
             ExprNode::Super { args: Some(args) }
@@ -1923,6 +1930,45 @@ fn detect_leading_guard<'a>(node: &Node<'a>) -> Option<Node<'a>> {
         return None;
     }
     Some(if_node.predicate())
+}
+
+/// Ingest a call/`super` argument list, expanding a `...` forwarding
+/// marker (`ForwardingArgumentsNode`) into the `*args, **kwargs` pair
+/// it stands for — the exact trio `ingest_library_method`'s
+/// `forwards_all` branch synthesizes on the receiving `def`, so a
+/// `def x(...); y(...); end` round-trips through matching `Var`
+/// references on both sides. Returns the expanded args plus whether
+/// the marker was present, so a `Send`-shaped caller can also forward
+/// the block (see the `forwards_block` use at the `CallNode` ingest
+/// site). `super(...)` ignores the flag — `ExprNode::Super` has no
+/// block slot; Ruby's `super` forwards the block implicitly either way.
+///
+/// Ruby allows leading explicit args before `...` (`def x(a, ...); y(a,
+/// ...); end`), so this walks every element rather than assuming `...`
+/// is the sole one.
+fn ingest_forwardable_arguments(
+    a: &ruby_prism::ArgumentsNode<'_>,
+    file: &str,
+) -> IngestResult<(Vec<Expr>, bool)> {
+    let mut args = Vec::new();
+    let mut forwards = false;
+    for arg in a.arguments().iter() {
+        if arg.as_forwarding_arguments_node().is_some() {
+            forwards = true;
+            let fwd_args = Expr::new(
+                Span::synthetic(),
+                ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("__fwd_args") },
+            );
+            args.push(Expr::new(Span::synthetic(), ExprNode::Splat { value: fwd_args }));
+            args.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("__fwd_kwargs") },
+            ));
+            continue;
+        }
+        args.push(ingest_expr(&arg, file)?);
+    }
+    Ok((args, forwards))
 }
 
 /// Ingest a `CallNode`'s block — the `do |...| ... end` or `{ |...| ... }`
