@@ -151,7 +151,18 @@ impl Overlay {
         }
 
         let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
-        Analyzer::new(&app).analyze(&mut app);
+        // The lowerings run BEFORE `diagnose`, and BEFORE `target_files`
+        // is asked for the emitted tree — that is the order every real
+        // consumer uses (`bin/roundhouse`, the IDE overlay; see
+        // `tests/real_blog.rs::type_analysis_coverage`'s identical
+        // comment). Skipping it here used to mean this harness "ran"
+        // the emitted program without ever exercising the ~20
+        // post-analyze lowering passes (kwsplat's `**` re-expansion,
+        // arel, blank, …) — every `emit_and_run` test that happened
+        // not to need one passed by accident, not by proof.
+        let mut analyzer = Analyzer::new(&app);
+        analyzer.analyze(&mut app);
+        roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry());
         let errors = diagnose(&app)
             .into_iter()
             .filter(|d| d.severity == Severity::Error)

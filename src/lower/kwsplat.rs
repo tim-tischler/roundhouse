@@ -367,7 +367,32 @@ fn erased_splat_against(args: &[Expr], params: &[Param]) -> Option<ErasedSplat> 
         .filter(|p| p.keyword)
         .map(|p| (p.name.clone(), p.default.clone()))
         .collect();
-    if keywords.is_empty() || args.len() != positional + 1 {
+    if keywords.is_empty() {
+        return None;
+    }
+    // `def x(...); y(...); end` forwarding (`ingest::
+    // ingest_forwardable_arguments`) desugars to `y(*__fwd_args,
+    // __fwd_kwargs)` — a Splat of unknown static length immediately
+    // before the erased bundle, so the plain arity check below (which
+    // assumes every OTHER arg is exactly one callee positional) can't
+    // tell whether this call has the right shape; a splat of length 2
+    // looks identical to one of length 5. Recognize the synthesized
+    // name exactly instead of counting: no hand-written Ruby can
+    // produce `__fwd_args`/`__fwd_kwargs` (they are not valid targets
+    // of `...`, which is the only source of the name), so this is
+    // exact, not a heuristic — unlike the general arity inference,
+    // which stays exactly as conservative as before for everything
+    // else.
+    let is_forwarded_kwrest = matches!(
+        &*last.node,
+        ExprNode::Var { name, .. } if name.as_str() == "__fwd_kwargs"
+    ) && args.len() >= 2
+        && matches!(
+            &*args[args.len() - 2].node,
+            ExprNode::Splat { value }
+                if matches!(&*value.node, ExprNode::Var { name, .. } if name.as_str() == "__fwd_args")
+        );
+    if !is_forwarded_kwrest && args.len() != positional + 1 {
         return None;
     }
     // A keyword param carrying a default is Ruby's optional keyword; it

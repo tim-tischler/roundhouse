@@ -292,3 +292,54 @@ fn method_ref_block_arg_runs() {
         .run_test("test/models/doubler_test.rb")
         .assert_passes();
 }
+
+/// Gap F7 took `def x(...)` / `y(...)` from an ingest error
+/// (`ForwardingParameterNode`/`ForwardingArgumentsNode` had no arm)
+/// to clean, desugaring to the `*args, **kwargs, &blk` trio the IR
+/// already models. Invariant 6: prove the emitted program actually
+/// forwards all three — positional args, a keyword arg, AND a block —
+/// through one `...` call, not just that `check` stays quiet.
+#[test]
+fn forwarding_call_forwards_args_kwargs_and_block() {
+    // Two shapes to steer clear of, both pre-existing kwsplat/ingest
+    // approximations this task doesn't own:
+    //   - An explicit LOCAL-VAR receiver, not an ivar: `lower::
+    //     kwsplat`'s `callee_params` matches `Ty::Class` exactly and
+    //     doesn't peel a `Ty::Union` — an ivar's inferred type is
+    //     nilable (`Combiner | Nil`), which fails that match, so the
+    //     `**` re-expansion silently declines for an ivar receiver.
+    //   - A REQUIRED keyword (`factor:`), not an optional one with a
+    //     default: `ingest_library_method` flattens a LONE optional
+    //     keyword to a plain positional-with-default (`factor = 1`)
+    //     when nothing else in the signature forces true keyword
+    //     representation, and `lower::kwsplat`'s erased-splat
+    //     recognition only fires for a param whose `Param.keyword` is
+    //     still `true` post-flattening.
+    emit_and_run::real_blog()
+        .write(
+            "app/lib/multiplier.rb",
+            "class Multiplier\n  \
+               def call(...)\n    \
+                 helper = Combiner.new\n    \
+                 helper.combine(...)\n  \
+               end\n\
+             end\n\n\
+             class Combiner\n  \
+               def combine(a, b, factor:, &blk)\n    \
+                 result = (a + b) * factor\n    \
+                 blk ? blk.call(result) : result\n  \
+               end\n\
+             end\n",
+        )
+        .write(
+            "test/models/multiplier_test.rb",
+            "require \"test_helper\"\n\n\
+             class MultiplierTest < ActiveSupport::TestCase\n  \
+               test \"...forwards positional args, kwargs, and a block\" do\n    \
+                 assert_equal 11, Multiplier.new.call(2, 3, factor: 2) { |r| r + 1 }\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/multiplier_test.rb")
+        .assert_passes();
+}

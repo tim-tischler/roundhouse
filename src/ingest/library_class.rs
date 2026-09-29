@@ -1672,8 +1672,23 @@ pub(super) fn ingest_library_method(
     // Bodies under app/models/ legitimately use optionals (`attrs = {}`)
     // and keywords (`columns:`); the model ingest doesn't need them yet
     // but library classes do.
+    // `def x(...)` / `def x(a, ...)` — argument forwarding (Prism
+    // parses the `...` marker into the SAME `keyword_rest` slot an
+    // explicit `**kwrest` occupies, but as a `ForwardingParameterNode`
+    // rather than a `KeywordRestParameterNode`, so it falls through
+    // every kind-specific arm below untouched). Desugar to exactly the
+    // `*args, **kwargs, &blk` trio it is Ruby-equivalent to: leading
+    // explicit params (if any) are ingested normally by the loops
+    // below, and the trio is appended once the loop finishes, in
+    // Ruby-valid order — see `forwards_all` below. `try_ingest_...` on
+    // the call side (`ingest_expr`'s `ForwardingArgumentsNode` arm)
+    // reads the same three synthesized names, so `def x(...); y(...);
+    // end` round-trips through matching Var references.
     let mut params: Vec<Param> = Vec::new();
+    let mut forwards_all = false;
     if let Some(pn) = def.parameters() {
+        forwards_all =
+            pn.keyword_rest().is_some_and(|n| n.as_forwarding_parameter_node().is_some());
         for req in pn.requireds().iter() {
             if let Some(rp) = req.as_required_parameter_node() {
                 params.push(Param::positional(Symbol::from(constant_id_str(&rp.name()))));
@@ -1819,19 +1834,39 @@ pub(super) fn ingest_library_method(
             }
         }
     }
+    if forwards_all {
+        // Ruby-valid order: positional rest, then keyword-rest. Unlike
+        // the flattened-`**opts`-beside-`*rest` approximation above
+        // (which drops the kwrest slot rather than parse-breaking a
+        // real `def`), forwarding's `...` is ALWAYS both at once — so
+        // build the true `KeywordRest` kind directly rather than going
+        // through the positional-with-default approximation.
+        params.push(Param::rest(Symbol::from("__fwd_args")));
+        let mut kwrest = Param::keyword(Symbol::from("__fwd_kwargs"), None);
+        kwrest.rest = true;
+        params.push(kwrest);
+    }
 
     // `&block` rides in `MethodDef.block_param`, not the flat list —
     // it occupies the call-site `block:` slot, never `args:`. Mirrors
-    // the runtime_src split (see runtime_src::method_params).
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
-            // name so body-side bare-`&` forwarding (`__blk`) binds.
-            .unwrap_or("__blk");
-        Param::positional(Symbol::from(name))
-    });
+    // the runtime_src split (see runtime_src::method_params). `...`
+    // forwards the block too (same synthesized name the call-side
+    // `ForwardingArgumentsNode` desugar reads), even though Prism
+    // never populates `pn.block()` for it — the marker is entirely in
+    // `keyword_rest`, so `forwards_all` is checked first.
+    let block_param = if forwards_all {
+        Some(Param::positional(Symbol::from("__fwd_blk")))
+    } else {
+        def.parameters().and_then(|pn| pn.block()).map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
+                // name so body-side bare-`&` forwarding (`__blk`) binds.
+                .unwrap_or("__blk");
+            Param::positional(Symbol::from(name))
+        })
+    };
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
