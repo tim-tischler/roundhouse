@@ -36,6 +36,34 @@ use super::view::{ViewEngine, ingest_template};
 use super::survey::{self, unwrap_or_record};
 use super::{IngestError, IngestResult};
 
+/// Read a file's bytes for one of the per-file walks below (ERB,
+/// jbuilder, models, controllers, migrations, `structure.sql`, routes
+/// split files, …). An unreadable file — the shape that matters in
+/// practice is a symlink whose target is absent (Procore's
+/// `app/views/shared/_princess_footer.pdf.erb` points into a
+/// `components/` package that can be missing from a given checkout) —
+/// used to propagate through the walk's `?` and abort the ENTIRE app
+/// ingest over one bad file. In survey mode this records a `file not
+/// readable` gap and returns `None` so the caller skips just that
+/// file, the same as any other per-file gap; in strict mode it still
+/// propagates — that is what strict mode is for.
+fn read_or_ledger<V: Vfs + ?Sized>(vfs: &V, path: &Path) -> IngestResult<Option<Vec<u8>>> {
+    unwrap_or_record(vfs.read(path).map_err(|e| IngestError::Unsupported {
+        file: path.display().to_string(),
+        message: format!("file not readable: {e} ({})", path.display()),
+    }))
+}
+
+/// String-reading twin of [`read_or_ledger`] — same ledger-or-propagate
+/// behavior, for the ERB/jbuilder/rbs walks that read UTF-8 text
+/// directly rather than raw bytes.
+fn read_to_string_or_ledger<V: Vfs + ?Sized>(vfs: &V, path: &Path) -> IngestResult<Option<String>> {
+    unwrap_or_record(vfs.read_to_string(path).map_err(|e| IngestError::Unsupported {
+        file: path.display().to_string(),
+        message: format!("file not readable: {e} ({})", path.display()),
+    }))
+}
+
 /// Ingest an entire Rails app directory from disk.
 ///
 /// A root that is not a directory is an error, not an empty app: the
@@ -230,11 +258,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     if vfs.exists(&schema_path) {
-        let source = vfs.read(&schema_path)?;
-        if let Some(schema) =
-            unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
-        {
-            app.schema = schema;
+        if let Some(source) = read_or_ledger(vfs, &schema_path)? {
+            if let Some(schema) =
+                unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
+            {
+                app.schema = schema;
+            }
         }
     } else if vfs.exists(&structure_path) {
         // `config.active_record.schema_format = :sql` apps (Postgres,
@@ -287,7 +316,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
             let mut schema = crate::schema::Schema::default();
             for entry in files {
-                let source = vfs.read(&entry)?;
+                let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
                 unwrap_or_record(ingest_migration(
                     &source,
                     &entry.display().to_string(),
@@ -335,7 +364,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             continue;
         }
         for entry in read_rb_files(vfs, &models_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             table_prefixes
                 .extend(super::model::ingest_table_name_prefixes(&source, &entry.display().to_string()));
             model_bases.record(&source, &mut base_pairs);
@@ -367,7 +396,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             continue;
         }
         for entry in read_rb_files(vfs, &models_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             match classify_class_file(&source, &model_bases) {
                 Some(ClassKind::Model) | None => {
@@ -1004,7 +1033,7 @@ end
             continue;
         }
         for entry in read_rb_files(vfs, &controllers_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             if let Some(maybe_controller) =
                 unwrap_or_record(ingest_controller(&source, &path_str))?
@@ -1068,36 +1097,37 @@ end
 
     let routes_path = dir.join("config/routes.rb");
     if vfs.exists(&routes_path) {
-        let source = vfs.read(&routes_path)?;
-        // `draw(:name)` split files — Rails loads
-        // `config/routes/<name>.rb` into the same DSL context, and
-        // Mastodon-class apps keep most of their route table there.
-        let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::new();
-        let routes_dir = dir.join("config/routes");
-        if vfs.is_dir(&routes_dir) {
-            for entry in read_rb_files(vfs, &routes_dir)? {
-                let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let split_source = vfs.read(&entry)?;
-                draw_files
-                    .insert(stem.to_string(), (split_source, entry.display().to_string()));
+        if let Some(source) = read_or_ledger(vfs, &routes_path)? {
+            // `draw(:name)` split files — Rails loads
+            // `config/routes/<name>.rb` into the same DSL context, and
+            // Mastodon-class apps keep most of their route table there.
+            let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::new();
+            let routes_dir = dir.join("config/routes");
+            if vfs.is_dir(&routes_dir) {
+                for entry in read_rb_files(vfs, &routes_dir)? {
+                    let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Some(split_source) = read_or_ledger(vfs, &entry)? else { continue };
+                    draw_files
+                        .insert(stem.to_string(), (split_source, entry.display().to_string()));
+                }
             }
-        }
-        if let Some(routes) = unwrap_or_record(ingest_routes_with_draws(
-            &source,
-            &routes_path.display().to_string(),
-            &draw_files,
-        ))? {
-            // `to: redirect("/x")` routes point at actions nobody
-            // wrote, so write them: one controller, one action per
-            // redirect, each a `redirect_to <literal>, status: …`. It
-            // is the shape an app uses by hand for the same thing, and
-            // it keeps the redirect out of every emitter's route kind.
-            if !routes.redirects.is_empty() {
-                app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+            if let Some(routes) = unwrap_or_record(ingest_routes_with_draws(
+                &source,
+                &routes_path.display().to_string(),
+                &draw_files,
+            ))? {
+                // `to: redirect("/x")` routes point at actions nobody
+                // wrote, so write them: one controller, one action per
+                // redirect, each a `redirect_to <literal>, status: …`. It
+                // is the shape an app uses by hand for the same thing, and
+                // it keeps the redirect out of every emitter's route kind.
+                if !routes.redirects.is_empty() {
+                    app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+                }
+                app.routes = routes;
             }
-            app.routes = routes;
         }
     }
 
@@ -1108,7 +1138,7 @@ end
         }
         let erb_files = read_erb_files(vfs, &views_dir)?;
         for (erb_path, engine) in erb_files {
-            let source = vfs.read_to_string(&erb_path)?;
+            let Some(source) = read_to_string_or_ledger(vfs, &erb_path)? else { continue };
             let rel = erb_path
                 .strip_prefix(&views_dir)
                 .map_err(|_| IngestError::Unsupported {
@@ -1137,7 +1167,7 @@ end
 
         let jbuilder_files = read_jbuilder_files(vfs, &views_dir)?;
         for jb_path in jbuilder_files {
-            let source = vfs.read_to_string(&jb_path)?;
+            let Some(source) = read_to_string_or_ledger(vfs, &jb_path)? else { continue };
             let rel = jb_path
                 .strip_prefix(&views_dir)
                 .map_err(|_| IngestError::Unsupported {
@@ -1170,12 +1200,14 @@ end
     let test_case_setup: Option<crate::expr::Expr> = {
         let helper_rb = dir.join("test/test_helper.rb");
         if vfs.exists(&helper_rb) {
-            let source = vfs.read(&helper_rb)?;
-            unwrap_or_record(super::test::ingest_test_case_setup(
-                &source,
-                &helper_rb.display().to_string(),
-            ))?
-            .flatten()
+            match read_or_ledger(vfs, &helper_rb)? {
+                Some(source) => unwrap_or_record(super::test::ingest_test_case_setup(
+                    &source,
+                    &helper_rb.display().to_string(),
+                ))?
+                .flatten(),
+                None => None,
+            }
         } else {
             None
         }
@@ -1199,7 +1231,7 @@ end
         let tests_dir = dir.join(subdir);
         if vfs.is_dir(&tests_dir) {
             for entry in read_rb_files(vfs, &tests_dir)? {
-                let source = vfs.read(&entry)?;
+                let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
                 if let Some(tms) =
                     unwrap_or_record(ingest_test_files(&source, &entry.display().to_string()))?
                 {
@@ -1222,7 +1254,7 @@ end
     let fixtures_dir = dir.join("test/fixtures");
     if vfs.is_dir(&fixtures_dir) {
         for entry in read_yml_files(vfs, &fixtures_dir)? {
-            let source = vfs.read(&entry)?;
+            let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             // ERB tags are lifted out and carried as expressions rather
             // than dropped — see `ingest::fixture`. A file whose ERB we
             // genuinely can't ingest still records a ledger line and is
@@ -1243,11 +1275,12 @@ end
     // fresh.
     let seeds_path = dir.join("db/seeds.rb");
     if vfs.exists(&seeds_path) {
-        let source = vfs.read_to_string(&seeds_path)?;
-        if let Some(expr) =
-            unwrap_or_record(ingest_ruby_program(&source, &seeds_path.display().to_string()))?
-        {
-            app.seeds = Some(expr);
+        if let Some(source) = read_to_string_or_ledger(vfs, &seeds_path)? {
+            if let Some(expr) =
+                unwrap_or_record(ingest_ruby_program(&source, &seeds_path.display().to_string()))?
+            {
+                app.seeds = Some(expr);
+            }
         }
     }
 
@@ -1258,15 +1291,16 @@ end
     // `javascript_importmap_tags` helper.
     let importmap_path = dir.join("config/importmap.rb");
     if vfs.exists(&importmap_path) {
-        let source = vfs.read_to_string(&importmap_path)?;
-        if let Some(importmap) = unwrap_or_record(ingest_importmap(
-            vfs,
-            &source,
-            dir,
-            &importmap_path.display().to_string(),
-        ))? {
-            if !importmap.pins.is_empty() {
-                app.importmap = Some(importmap);
+        if let Some(source) = read_to_string_or_ledger(vfs, &importmap_path)? {
+            if let Some(importmap) = unwrap_or_record(ingest_importmap(
+                vfs,
+                &source,
+                dir,
+                &importmap_path.display().to_string(),
+            ))? {
+                if !importmap.pins.is_empty() {
+                    app.importmap = Some(importmap);
+                }
             }
         }
     }
@@ -1363,7 +1397,7 @@ end
                 if entry.extension().and_then(|s| s.to_str()) != Some("rbs") {
                     continue;
                 }
-                let source = vfs.read_to_string(&entry)?;
+                let Some(source) = read_to_string_or_ledger(vfs, &entry)? else { continue };
                 let path_str = entry.display().to_string();
                 let parsed = crate::rbs::parse_app_signatures(&source).map_err(|message| {
                     IngestError::Parse {
@@ -4725,13 +4759,14 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
     let mut wanted: Vec<Symbol> = Vec::new();
     let helper_rb = dir.join("test/test_helper.rb");
     if vfs.exists(&helper_rb) {
-        let source = vfs.read(&helper_rb)?;
-        if let Some(classes) = unwrap_or_record(ingest_library_classes(
-            &source,
-            &helper_rb.display().to_string(),
-        ))? {
-            for lc in classes {
-                wanted.extend(lc.includes.iter().map(|c| c.0.clone()));
+        if let Some(source) = read_or_ledger(vfs, &helper_rb)? {
+            if let Some(classes) = unwrap_or_record(ingest_library_classes(
+                &source,
+                &helper_rb.display().to_string(),
+            ))? {
+                for lc in classes {
+                    wanted.extend(lc.includes.iter().map(|c| c.0.clone()));
+                }
             }
         }
     }
@@ -4741,7 +4776,7 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
 
     let mut out: Vec<LibraryClass> = Vec::new();
     for entry in read_rb_files(vfs, &helpers_dir)? {
-        let source = vfs.read(&entry)?;
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         let Some(classes) =
             unwrap_or_record(ingest_library_classes(&source, &entry.display().to_string()))?
         else {
