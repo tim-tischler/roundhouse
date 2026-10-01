@@ -1378,14 +1378,212 @@ fn multi_write_with_attr_targets_ingests_and_round_trips() {
     }
 }
 
-/// `enum :x, CONST.map { |v| [v, v.to_s] }.to_h` — Procore's
-/// `bid_package.rb` (`ACCOUNTING_METHODS.map { |method| [method,
-/// method.to_s] }.to_h`) and `potential_change_order.rb` compute an
-/// identity STRING mapping over a constant instead of writing the hash
-/// out by hand. Unlike a bare `enum :x, CONST` (which stores each
-/// label at its array INDEX, Rails' default), this form explicitly
-/// stores each label as its own name — the resulting values must be
-/// `Str`, not the `Int` a plain array mapping would give.
+#[test]
+fn defined_extended_targets_ingest_and_round_trip() {
+    // `defined?` beyond the bareword partial-local idiom: a constant, a
+    // qualified constant path, a real receiver/call chain, and bare
+    // `super`. Each lifts to the same marker-Send shape the bareword
+    // form already used (`Send(None, :defined?, [operand])`), just with
+    // a richer operand — see the `n.as_defined_node()` arm in
+    // `src/ingest/expr.rs`.
+    use roundhouse::emit::ruby::emit_expr;
+    use roundhouse::expr::ExprNode;
+
+    fn ingest_first(source: &[u8]) -> Expr {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        let stmt = prog.statements().body().iter().next().unwrap();
+        roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap()
+    }
+
+    // `defined?(Const)` — a bare constant operand.
+    let e = ingest_first(b"defined?(Widget)");
+    match &*e.node {
+        ExprNode::Send { recv: None, method, args, .. } => {
+            assert_eq!(method.as_str(), "defined?");
+            assert_eq!(args.len(), 1);
+            match &*args[0].node {
+                ExprNode::Const { path } => {
+                    assert_eq!(path.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["Widget"]);
+                }
+                other => panic!("expected Const, got {other:?}"),
+            }
+        }
+        other => panic!("expected Send(defined?, ...), got {other:?}"),
+    }
+    let round_tripped = emit_expr(&ingest_first(emit_expr(&e).as_bytes()));
+    assert_eq!(round_tripped, emit_expr(&e), "defined?(Const) must round-trip");
+
+    // `defined?(A::B)` — a qualified constant path.
+    let e = ingest_first(b"defined?(Widget::Kind)");
+    match &*e.node {
+        ExprNode::Send { args, .. } => match &*args[0].node {
+            ExprNode::Const { path } => {
+                assert_eq!(
+                    path.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    vec!["Widget", "Kind"]
+                );
+            }
+            other => panic!("expected Const, got {other:?}"),
+        },
+        other => panic!("expected Send(defined?, ...), got {other:?}"),
+    }
+
+    // `defined?(a.b)` — a real receiver/call chain, not the bareword
+    // partial-local idiom (which has no receiver and no args).
+    let e = ingest_first(b"defined?(widget.kind)");
+    match &*e.node {
+        ExprNode::Send { args, .. } => match &*args[0].node {
+            ExprNode::Send { recv: Some(_), method, .. } => {
+                assert_eq!(method.as_str(), "kind");
+            }
+            other => panic!("expected a receiver Send, got {other:?}"),
+        },
+        other => panic!("expected Send(defined?, ...), got {other:?}"),
+    }
+    let round_tripped = emit_expr(&ingest_first(emit_expr(&e).as_bytes()));
+    assert_eq!(round_tripped, emit_expr(&e), "defined?(a.b) must round-trip");
+
+    // `defined?(super)` — bare `super`, no parens.
+    let e = ingest_first(b"defined?(super)");
+    match &*e.node {
+        ExprNode::Send { args, .. } => {
+            assert!(matches!(&*args[0].node, ExprNode::Super { args: None }));
+        }
+        other => panic!("expected Send(defined?, ...), got {other:?}"),
+    }
+    let round_tripped = emit_expr(&ingest_first(emit_expr(&e).as_bytes()));
+    assert_eq!(round_tripped, emit_expr(&e), "defined?(super) must round-trip");
+}
+
+#[test]
+fn class_variable_compound_assignment_in_method_body_ingests_and_round_trips() {
+    // `@@x ||= y` / `@@x = y` in a method body (as opposed to the
+    // class-body initializer `library_class.rs` handles separately).
+    // Both mirror the local-variable-write arms: the `@@`-prefixed name
+    // rides straight into `LValue::Var` so the sigil round-trips on
+    // emit without a dedicated class-variable target, matching how a
+    // class-variable READ already ingests (`n.as_class_variable_read_node()`).
+    use roundhouse::emit::ruby::emit_expr;
+    use roundhouse::expr::{ExprNode, LValue, OpAssignOp};
+
+    fn ingest_first(source: &[u8]) -> Expr {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        let stmt = prog.statements().body().iter().next().unwrap();
+        roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap()
+    }
+
+    let or_write = ingest_first(b"@@count ||= 0");
+    match &*or_write.node {
+        ExprNode::OpAssign { target: LValue::Var { name, .. }, op, .. } => {
+            assert_eq!(name.as_str(), "@@count");
+            assert_eq!(*op, OpAssignOp::OrOr);
+        }
+        other => panic!("expected OpAssign(@@count, OrOr, ...), got {other:?}"),
+    }
+    let emitted = emit_expr(&or_write);
+    assert_eq!(emitted, "@@count ||= 0");
+    assert_eq!(emit_expr(&ingest_first(emitted.as_bytes())), emitted);
+
+    let plain_write = ingest_first(b"@@count = 1");
+    match &*plain_write.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+            assert_eq!(name.as_str(), "@@count");
+        }
+        other => panic!("expected Assign(@@count, ...), got {other:?}"),
+    }
+    let emitted = emit_expr(&plain_write);
+    assert_eq!(emitted, "@@count = 1");
+    assert_eq!(emit_expr(&ingest_first(emitted.as_bytes())), emitted);
+}
+
+#[test]
+fn specific_ledger_messages_replace_the_generic_catch_all() {
+    // Constructs that cannot round-trip at all (a shell-out, a Prism
+    // recovery node, a global write, a runtime class/module def) should
+    // report BY NAME, not fall through to "unsupported expression node:
+    // <debug dump>" — the generic message that makes every one of these
+    // indistinguishable in the ledger.
+    use roundhouse::ingest::IngestError;
+
+    fn ingest_first_err(source: &[u8]) -> String {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        let stmt = prog.statements().body().iter().next().unwrap();
+        match roundhouse::ingest::ingest_expr(&stmt, "<snippet>") {
+            Err(IngestError::Unsupported { message, .. }) => message,
+            other => panic!("expected IngestError::Unsupported, got {other:?}"),
+        }
+    }
+
+    assert_eq!(ingest_first_err(b"`ls`"), "shell command (backticks) is not modeled");
+    assert_eq!(
+        ingest_first_err(b"%x{ls}"),
+        "shell command (backticks) is not modeled"
+    );
+    assert_eq!(ingest_first_err(b"$stdout = out"), "global variable write");
+    assert_eq!(
+        ingest_first_err(b"class Foo; end"),
+        "class/module defined inside a method or block (runtime class definition)"
+    );
+    assert_eq!(
+        ingest_first_err(b"module Foo; end"),
+        "class/module defined inside a method or block (runtime class definition)"
+    );
+    // `1 + ` — a dangling binary operator. Prism recovers by inserting a
+    // `MissingNode` in the missing operand's place.
+    assert_eq!(
+        ingest_first_err(b"1 + "),
+        "unparsed fragment (Prism recovery node)"
+    );
+}
+
+#[test]
+fn multi_write_with_post_rest_targets_ingests_and_round_trips() {
+    // `a, *b, c = expr` — a target AFTER the splat. `b` claims
+    // everything between the leading positionals and the trailing
+    // ones; `c` reads from the tail by negative index regardless of
+    // how long `b` ends up being.
+    use roundhouse::emit::ruby::emit_expr;
+
+    fn ingest_first(source: &[u8]) -> Expr {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        let stmt = prog.statements().body().iter().next().unwrap();
+        roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap()
+    }
+
+    // The desugar expands one source statement into several emitted
+    // lines (a temp bind, then one assignment per target), so
+    // re-ingesting for the round-trip check needs the WHOLE statement
+    // list, not just its first line — mirrors how `ingest_ruby_program`
+    // (and `roundhouse-ast --round-trip`) ingest a full program.
+    fn ingest_program(source: &[u8]) -> Expr {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        roundhouse::ingest::ingest_expr(&prog.statements().as_node(), "<snippet>").unwrap()
+    }
+
+    let e = ingest_first(b"a, *b, c = [1, 2, 3, 4]");
+    let emitted = emit_expr(&e);
+    assert!(emitted.contains("a = "), "leading target reads positionally:\n{emitted}");
+    assert!(
+        emitted.contains("...-1]") || emitted.contains("... -1]"),
+        "the rest slice stops short of the trailing target(s):\n{emitted}"
+    );
+    assert!(emitted.contains("[-1]"), "the trailing target reads off the tail:\n{emitted}");
+
+    // Re-ingesting the emitted Ruby (now several statements) must reach
+    // the same fixed point.
+    assert_eq!(emit_expr(&ingest_program(emitted.as_bytes())), emitted);
+}
+
 #[test]
 fn computed_enum_map_to_h_over_constant_ingests() {
     use roundhouse::ingest::ingest_app_from_tree;

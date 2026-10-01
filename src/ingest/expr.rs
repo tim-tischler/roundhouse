@@ -76,14 +76,6 @@ fn ingest_multi_write(
     span: Span,
     file: &str,
 ) -> IngestResult<ExprNode> {
-    // Post-rest targets (`*init, last = c`) need length-relative
-    // indexing off the tail; still out of scope.
-    if mw.rights().iter().next().is_some() {
-        return Err(IngestError::Unsupported {
-            file: file.into(),
-            message: "multi-write with post-rest targets not yet supported".into(),
-        });
-    }
     let mut targets: Vec<crate::expr::LValue> = Vec::new();
     for left in mw.lefts().iter() {
         targets.push(multi_write_target(&left, file)?);
@@ -107,11 +99,30 @@ fn ingest_multi_write(
     let tmp_read = || {
         Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: tmp.clone() })
     };
-    let int_lit = |v: usize| {
-        Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v as i64 } })
+    let int_lit = |v: i64| {
+        Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v } })
     };
+    let index_read = |index: Expr| {
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(tmp_read()),
+                method: Symbol::from("[]"),
+                args: vec![index],
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    // `a, *b, c = expr` — POST-rest targets after the splat. Prism's
+    // `rights()` holds them (`c` here); reading them off the tail needs
+    // negative indices, and the rest binding (`b`) needs a slice rather
+    // than the plain `drop(n)` the no-rights case uses below — it has to
+    // stop short of the tail, not just skip the head.
+    let rights: Vec<Node<'_>> = mw.rights().iter().collect();
     let n_lefts = targets.len();
-    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + 3);
+    let n_rights = rights.len();
+    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + n_rights + 3);
     exprs.push(Expr::new(
         span,
         ExprNode::Assign {
@@ -120,33 +131,50 @@ fn ingest_multi_write(
         },
     ));
     for (i, target) in targets.into_iter().enumerate() {
-        let read = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(tmp_read()),
-                method: Symbol::from("[]"),
-                args: vec![int_lit(i)],
-                block: None,
-                parenthesized: true,
-            },
-        );
+        let read = index_read(int_lit(i as i64));
         exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
-    // Anonymous splat (`a, * = c`) discards the rest — only a named
-    // target gets a binding.
+    // Anonymous splat (`a, * = c` / `a, *, c = x`) discards the rest —
+    // only a named target gets a binding.
     if let Some(rest_node) = rest.as_splat_node().and_then(|s| s.expression()) {
         let rest_target = multi_write_target(&rest_node, file)?;
-        let drop = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(tmp_read()),
-                method: Symbol::from("drop"),
-                args: vec![int_lit(n_lefts)],
-                block: None,
-                parenthesized: true,
-            },
-        );
-        exprs.push(Expr::new(span, ExprNode::Assign { target: rest_target, value: drop }));
+        let rest_value = if n_rights == 0 {
+            // No post-rest targets: the rest is everything after the
+            // leading positionals.
+            Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(tmp_read()),
+                    method: Symbol::from("drop"),
+                    args: vec![int_lit(n_lefts as i64)],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        } else {
+            // Post-rest targets claim the tail: the rest is everything
+            // BETWEEN the leading positionals and the trailing ones —
+            // `temp[n_lefts...-n_rights]`, an exclusive range with a
+            // negative end that counts back from the tail regardless of
+            // the RHS's actual length.
+            index_read(Expr::new(
+                span,
+                ExprNode::Range {
+                    begin: Some(int_lit(n_lefts as i64)),
+                    end: Some(int_lit(-(n_rights as i64))),
+                    exclusive: true,
+                },
+            ))
+        };
+        exprs.push(Expr::new(span, ExprNode::Assign { target: rest_target, value: rest_value }));
+    }
+    // Each post-rest target reads from the tail by negative index:
+    // `a, *b, c, d = expr` puts `c` at `temp[-2]` and `d` at `temp[-1]`,
+    // regardless of how long `b` ends up being.
+    for (i, right_node) in rights.iter().enumerate() {
+        let target = multi_write_target(right_node, file)?;
+        let read = index_read(int_lit(-((n_rights - i) as i64)));
+        exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
     exprs.push(tmp_read());
     Ok(ExprNode::Seq { exprs })
@@ -563,18 +591,21 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // Rails view partials to check whether an optional local was
         // passed: `<% if defined?(show_tree_lines) && show_tree_lines %>`.
         //
-        // Restrict to the bareword shape Prism produces for the
-        // partial-local idiom: either a no-arg CallNode (when the name
-        // isn't lexically bound, which is the partial-local case) or a
-        // LocalVariableReadNode (when it IS bound). Both lift to a
-        // `Var(name)` reference inside a marker Send. Other shapes
-        // (`defined?(@ivar)`, `defined?(Foo)`, `defined?(obj.method)`)
-        // have target-different semantics and surface as Unsupported
-        // for now — lobsters/real-blog don't use them.
-        //
-        // The view-lowerer picks up the inner Var as a partial
-        // parameter (collect_extra_params) then rewrites the marker
-        // Send to `!name.nil?` (rewrite_defined_to_nil_check).
+        // The bareword shape Prism produces for the partial-local idiom
+        // — either a no-arg CallNode (when the name isn't lexically
+        // bound, which is the partial-local case) or a
+        // LocalVariableReadNode (when it IS bound) — lifts to a
+        // `Var(name)` reference inside a marker Send; the view-lowerer
+        // picks up that inner Var as a partial parameter
+        // (collect_extra_params) then rewrites the marker Send to
+        // `!name.nil?` (rewrite_defined_to_nil_check). `defined?(@ivar)`,
+        // `defined?(Const)` / `defined?(A::B)`, `defined?(a.b)`, and
+        // `defined?(super)` extend the same marker-Send shape with their
+        // own operand expression — none of them are partial-local
+        // guards, so the view-lowerer's Var-based rewrite never sees
+        // them, and the analyzer's universal `defined?` typing (`Str?`,
+        // see `analyze/body/send.rs`) covers all of them alike since it
+        // dispatches on the method name, not the operand shape.
         n if n.as_defined_node().is_some() => {
             let d = n.as_defined_node().unwrap();
             let inner = d.value();
@@ -604,42 +635,75 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     },
                 ));
             }
-            let name: Option<String> = if let Some(c) = inner.as_call_node() {
-                let bareword = c.receiver().is_none()
-                    && c.arguments().is_none()
-                    && c.block().is_none();
+            // `defined?(Const)` / `defined?(A::B)` — whether a constant
+            // resolves is, in principle, a fact the class registry could
+            // answer statically. Answering it here would mean
+            // duplicating the registry's own resolution timing inside
+            // ingest, before the registry is even built; leaving it as
+            // a runtime check — same marker-Send shape as every other
+            // `defined?` target — is exactly as correct (Ruby evaluates
+            // it at runtime too) and costs nothing extra.
+            let arg: Option<Expr> = if let Some(cr) = inner.as_constant_read_node() {
+                Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Const { path: vec![Symbol::from(constant_id_str(&cr.name()))] },
+                ))
+            } else if let Some(cp) = inner.as_constant_path_node() {
+                Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Const { path: constant_path_segments(&cp) },
+                ))
+            } else if inner.as_forwarding_super_node().is_some() {
+                // `defined?(super)` — bare `super`, no parens. Same
+                // `ExprNode::Super` a plain `super` statement ingests
+                // to; `defined?` only asks whether it resolves; it does
+                // not invoke it.
+                Some(Expr::new(Span::synthetic(), ExprNode::Super { args: None }))
+            } else if let Some(c) = inner.as_call_node() {
+                let bareword =
+                    c.receiver().is_none() && c.arguments().is_none() && c.block().is_none();
                 if bareword {
-                    Some(constant_id_str(&c.name()).to_string())
-                } else {
-                    None
-                }
-            } else if let Some(lv) = inner.as_local_variable_read_node() {
-                Some(constant_id_str(&lv.name()).to_string())
-            } else {
-                None
-            };
-            match name {
-                Some(name) => {
-                    let var = Expr::new(
+                    Some(Expr::new(
                         Span::synthetic(),
                         ExprNode::Var {
                             id: crate::ident::VarId(0),
-                            name: Symbol::from(name),
+                            name: Symbol::from(constant_id_str(&c.name())),
                         },
-                    );
-                    ExprNode::Send {
-                        recv: None,
-                        method: Symbol::from("defined?"),
-                        args: vec![var],
-                        block: None,
-                        parenthesized: true,
-                    }
+                    ))
+                } else {
+                    // `defined?(a.b)` — a real receiver/call chain, not
+                    // the partial-local idiom. Ingest it exactly like
+                    // any other expression; `defined?` only asks
+                    // whether it would raise, not what it returns, but
+                    // giving the analyzer the real Send lets it
+                    // type-check the receiver and args the same as
+                    // anywhere else in the body.
+                    Some(ingest_expr(&c.as_node(), file)?)
                 }
+            } else if let Some(lv) = inner.as_local_variable_read_node() {
+                Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Var {
+                        id: crate::ident::VarId(0),
+                        name: Symbol::from(constant_id_str(&lv.name())),
+                    },
+                ))
+            } else {
+                None
+            };
+            match arg {
+                Some(arg) => ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("defined?"),
+                    args: vec![arg],
+                    block: None,
+                    parenthesized: true,
+                },
                 None => {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
                         message: format!(
-                            "`defined?` only supports bareword targets today: {inner:?}"
+                            "`defined?` does not support this target yet: {inner:?}"
                         ),
                     });
                 }
@@ -651,6 +715,32 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_true_node().is_some() => ExprNode::Lit { value: Literal::Bool { value: true } },
         n if n.as_false_node().is_some() => ExprNode::Lit { value: Literal::Bool { value: false } },
         n if n.as_nil_node().is_some() => ExprNode::Lit { value: Literal::Nil },
+        // `__FILE__` — Ruby's magic constant for the current source
+        // file. Every target needs SOME literal here (Spinel included),
+        // and the path is a static fact the ingest already knows (`file`
+        // is exactly this file's identity), so there's no reason to
+        // treat it as a runtime-only construct. Rendered relative to the
+        // app root rather than verbatim (`file` is often an absolute
+        // filesystem path built from wherever the app was ingested from)
+        // so the literal doesn't bake a local machine's path into the
+        // emitted program. A read of `__FILE__` types as `Str` like any
+        // other string literal, so `File.expand_path('..', __FILE__)`
+        // and friends type-check through it for free.
+        n if n.as_source_file_node().is_some() => {
+            ExprNode::Lit { value: Literal::Str { value: app_relative_path(file) } }
+        }
+        // `__LINE__` — the current line number. Looked up in the
+        // per-thread source registry (`sources::register` already ran
+        // for every real file by the time its body is walked); a
+        // snippet ingested outside that registry (bare `roundhouse-ast
+        // -e` at a stage that skips `ingest_ruby_program`) has no
+        // source to count newlines against, so it falls back to `1`
+        // rather than failing ingest over a magic constant's exact value.
+        n if n.as_source_line_node().is_some() => {
+            let offset = n.location().start_offset();
+            let line = super::sources::line_at(file, offset).unwrap_or(1);
+            ExprNode::Lit { value: Literal::Int { value: line as i64 } }
+        }
         n if n.as_statements_node().is_some() => {
             let stmts = n.as_statements_node().unwrap();
             // The StatementsNode's own location slice is the source for
@@ -883,6 +973,24 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 value,
             }
         }
+        // `@@x = y` in a method body (as opposed to the class-body
+        // initializer `library_class.rs` handles separately). Mirrors
+        // the local-variable-write arm just above rather than the ivar
+        // one: like `n.as_class_variable_read_node()` below, the
+        // `@@`-prefixed name rides straight into `LValue::Var` so the
+        // sigil round-trips on emit (`LValue::Var { name, .. } =>
+        // name.to_string()` in `emit/ruby/expr.rs`) without a dedicated
+        // class-variable target — we don't model class-variable storage
+        // any more richly than that.
+        n if n.as_class_variable_write_node().is_some() => {
+            let w = n.as_class_variable_write_node().unwrap();
+            let name = Symbol::from(constant_id_str(&w.name()));
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                value,
+            }
+        }
         // `FOO = expr` — bare constant write. In a class body this is
         // a class-scoped constant; at top level it's a global constant.
         // Lowerers/emitters resolve the containing scope.
@@ -916,6 +1024,20 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // `x ||= y` — local var, short-circuit.
         n if n.as_local_variable_or_write_node().is_some() => {
             let w = n.as_local_variable_or_write_node().unwrap();
+            let name = Symbol::from(constant_id_str(&w.name()));
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                op: crate::expr::OpAssignOp::OrOr,
+                value,
+            }
+        }
+        // `@@x ||= y` — class var, short-circuit (the class-level
+        // memoization idiom, same shape as the local-var case above —
+        // see the plain `@@x = y` arm for why `LValue::Var` and not
+        // `LValue::Ivar` carries the `@@` sigil).
+        n if n.as_class_variable_or_write_node().is_some() => {
+            let w = n.as_class_variable_or_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
             let value = ingest_expr(&w.value(), file)?;
             ExprNode::OpAssign {
@@ -1833,6 +1955,51 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_def_node().is_some() => {
             ExprNode::Lit { value: Literal::Nil }
         }
+        // Backticks / `%x{…}` — a shell-out (`Kernel#\``). Not a
+        // construct any target can run, and not worth pretending to
+        // model; ledgered by name so it stops reading as the generic
+        // "unsupported expression node" catch-all.
+        n if n.as_x_string_node().is_some() || n.as_interpolated_x_string_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "shell command (backticks) is not modeled".into(),
+            });
+        }
+        // Prism's error-recovery node: the parser hit something it
+        // couldn't make sense of and inserted a placeholder to keep
+        // going. There is no real construct here to ingest — ledgered
+        // by name rather than falling through to the generic message,
+        // which would misleadingly imply a real Ruby node was rejected.
+        n if n.as_missing_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "unparsed fragment (Prism recovery node)".into(),
+            });
+        }
+        // `$stdout = …` — a global-variable write. Reads of the same
+        // sigil already ingest (see `n.as_global_variable_read_node()`
+        // above); writing global state isn't modeled, and the specific
+        // message says exactly what's missing instead of the generic one.
+        n if n.as_global_variable_write_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "global variable write".into(),
+            });
+        }
+        // `class`/`module` at expression position — e.g. inside a
+        // method or block body (`Class.new { class Foo; end }`,
+        // conditionally-defined classes). Unlike the class-BODY
+        // constructs `ingest::model`/`ingest::library_class` walk, a
+        // class or module built at runtime, mid-method, has no static
+        // home in the IR's class-table model — ledgered specifically
+        // rather than falling through to the generic message.
+        n if n.as_class_node().is_some() || n.as_module_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "class/module defined inside a method or block (runtime class definition)"
+                    .into(),
+            });
+        }
         other => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -2103,6 +2270,27 @@ fn ingest_hash_rest(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::Ha
         file: file.into(),
         message: format!("unsupported hash pattern rest node: {node:?}"),
     })
+}
+
+/// Best-effort app-root-relative rendering of an ingest `file` identity,
+/// for `__FILE__`. `file` is frequently an absolute filesystem path (it
+/// is built from wherever `ingest_app` was pointed), and baking that
+/// into an emitted literal would embed one machine's directory layout
+/// into the output. Rails apps keep every source file under one of a
+/// handful of top-level directories, so trimming everything before the
+/// first one found is a cheap, dependency-free way to recover the
+/// app-relative path without threading the app root through every
+/// `ingest_expr` call. Falls back to `file` unchanged when none match
+/// (already-relative paths, as `parse_one`-style tests use).
+fn app_relative_path(file: &str) -> String {
+    const ROOTS: &[&str] =
+        &["app/", "lib/", "config/", "db/", "spec/", "test/", "bin/", "script/"];
+    for root in ROOTS {
+        if let Some(idx) = file.find(root) {
+            return file[idx..].to_string();
+        }
+    }
+    file.to_string()
 }
 
 /// Map a Prism `binary_operator` symbol (`+`, `-`, `<<`, …) to the IR
@@ -2701,16 +2889,19 @@ fn ingest_hash_literal(
             });
         };
         // Anonymous `**` forwarding (`def f(**) ; g(**) ; end`) has no
-        // value to merge, and the declaration side drops the unnamed
-        // parameter — fail loud rather than emit a silently empty hash.
-        let Some(value) = splat.value() else {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "anonymous `**` keyword forwarding not yet supported".into(),
-            });
+        // value node of its own to ingest — `ingest_library_method`'s
+        // `keyword_rest` arm synthesizes a `__fwd_kwargs` parameter for
+        // exactly this case (same name `pr/argument-forwarding`'s `...`
+        // desugar uses), so a bare `**` here reads that binding rather
+        // than failing.
+        let value = match splat.value() {
+            Some(value) => ingest_expr(&value, file)?,
+            None => Expr::new(
+                Span::synthetic(),
+                ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("__fwd_kwargs") },
+            ),
         };
         saw_splat = true;
-        let value = ingest_expr(&value, file)?;
         chain = Some(merge_into(chain, std::mem::take(&mut pending), span, value));
     }
 
