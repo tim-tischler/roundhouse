@@ -387,10 +387,25 @@ pub(super) fn partial_from_receiver_type(ty: &Ty) -> Option<(String, String, Ty)
 /// Resolve a partial name relative to the current view's directory.
 /// `"form"` in `articles/index` → `articles/_form`; `"shared/nav"` (absolute,
 /// contains `/`) → `shared/_nav`.
+///
+/// Rails also accepts a *leading*-slash spelling of the same absolute form
+/// (`render partial: '/shared/nav'`) — the slash is just a "resolve from the
+/// view root, not the current controller's prefix" marker, not a literal
+/// path component. Ingested view names never carry one (`Path::strip_prefix`
+/// in `src/ingest/app.rs` produces `shared/_nav`, not `/shared/_nav`), so a
+/// leading slash has to be stripped before computing the directory — keeping
+/// it produces a Symbol (`/shared/_nav`) that never matches any real view,
+/// silently orphaning the render edge and, with it, the partial's feeders.
 pub(super) fn resolve_partial_path(name: &str, current_view: &Symbol) -> String {
+    let is_root_absolute = name.starts_with('/');
+    let name = name.strip_prefix('/').unwrap_or(name);
     if let Some(idx) = name.rfind('/') {
         let (dir, file) = name.split_at(idx + 1);
         format!("{dir}_{file}")
+    } else if is_root_absolute {
+        // Leading slash with no further `/` — still root-relative, not
+        // relative to `current_view`'s own directory.
+        format!("_{name}")
     } else {
         let current = current_view.as_str();
         match current.rfind('/') {

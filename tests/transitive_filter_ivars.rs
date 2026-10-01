@@ -451,3 +451,75 @@ end
         other => panic!("expected @project : Project, got {other:?}"),
     }
 }
+
+/// A view rendering a partial via Rails' absolute-path partial syntax
+/// (`render partial: '/foo/bar/baz'`, leading slash) must still feed the
+/// partial the rendering view's ivar context. Procore's real shape:
+/// `new.html.erb` (fed @project by its controller) renders `_general_settings_trs`
+/// via `render partial: '/project_area/.../general_settings_trs'` — the leading
+/// slash is just Rails' "resolve from the view root, not the current
+/// controller's prefix" marker, which `render_edges`/`view_feeders` treats as
+/// already-qualified either way. `resolve_partial_path` used to retain the
+/// leading `/` in the computed partial name (`/foo/bar/_baz`), a Symbol that
+/// never matches the actual ingested view name (`foo/bar/_baz`, no leading
+/// slash — `Path::strip_prefix` never produces one) — so the render edge
+/// silently pointed at a phantom view and the real partial got no feeder at
+/// all, leaving `@project` unresolved inside it.
+#[test]
+fn absolute_path_partial_render_still_inherits_feeder_ivars() {
+    let app = app_from_files(&[
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/project_area/widgets_controller.rb",
+            r#"class ProjectArea::WidgetsController < ApplicationController
+  before_action :load_project
+
+  def show
+  end
+
+  private
+
+  def load_project
+    @project = Project.find(params[:project_id])
+  end
+end
+"#,
+        ),
+        (
+            "app/models/project.rb",
+            "class Project < ApplicationRecord\nend\n",
+        ),
+        (
+            "app/views/project_area/widgets/show.html.erb",
+            "<%= render partial: '/project_area/widgets/settings' %>\n",
+        ),
+        (
+            "app/views/project_area/widgets/_settings.html.erb",
+            "<p><%= @project.name %></p>\n",
+        ),
+        ("db/schema.rb", SCHEMA_RB),
+    ]);
+
+    let unresolved = ivar_unresolved_names(&app);
+    assert!(
+        !unresolved.iter().any(|n| n == "project"),
+        "@project should reach the partial through an absolute-path render \
+         (leading slash); unresolved = {unresolved:?}"
+    );
+
+    let partial = app
+        .views
+        .iter()
+        .find(|v| v.name.as_str() == "project_area/widgets/_settings")
+        .expect("project_area/widgets/_settings view");
+    let mut reads = Vec::new();
+    collect_ivar_reads(&partial.body, &mut reads);
+    let ty = ivar_read_ty(&reads, "project").expect("@project read carries a type");
+    match ty {
+        Ty::Class { id, .. } => assert_eq!(id.0.as_str(), "Project"),
+        other => panic!("expected @project : Project, got {other:?}"),
+    }
+}
