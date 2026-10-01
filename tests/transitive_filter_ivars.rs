@@ -353,3 +353,101 @@ end
         ),
     }
 }
+
+/// A controller file that declares a SIBLING module in the same
+/// enclosing namespace, rather than a module lexically nested inside
+/// the chosen controller class — Procore's actual shape:
+/// `app/controllers/procore_controller/legacy_base.rb` defines `class
+/// LegacyBase < ...` and, as a plain sibling inside the same `module
+/// ProcoreController ... end` wrapper (not nested inside `LegacyBase`
+/// itself), `module Streaming` carrying `set_variables_in_authorize!`
+/// -> `set_project_variables!` -> `@project = Project.find(...)`.
+/// `ApplicationController` (here: `ProjectsController`, standing in
+/// for it) includes `ProcoreController::Streaming` directly and
+/// dispatches into it from its own `before_action` target.
+///
+/// Before the `nested_under` fix in `ingest/app.rs`, the controller
+/// ingest's `ingest_library_classes(&source, ...)` call DID find
+/// `ProcoreController::Streaming` in this file, but `nested_under`
+/// filtered it out: its qualified name doesn't start with
+/// `"ProcoreController::LegacyBase::"` (it isn't a lexical descendant
+/// of the chosen controller class, just a same-file, same-namespace
+/// sibling), so the whole module — and every method on it — was
+/// silently dropped from `app.library_classes`. No amount of depth or
+/// branch-walking in `collect_transitive_filter_ivars` can resolve a
+/// call into a method body that was never ingested in the first
+/// place, so `@project` stayed `ivar_unresolved` even with the
+/// transitive-filter-ivar-writes fix in place.
+#[test]
+fn sibling_module_in_controller_file_still_resolves_transitively() {
+    let app = app_from_files(&[
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/procore_controller/legacy_base.rb",
+            r#"module ProcoreController
+  class LegacyBase < ApplicationController
+  end
+
+  module Streaming
+    def set_variables_in_authorize!
+      set_project_variables!
+    end
+
+    def set_project_variables!
+      @project = Project.find(params[:id])
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/projects_controller.rb",
+            r#"class ProjectsController < ProcoreController::LegacyBase
+  include ProcoreController::Streaming
+
+  before_action :authorize
+
+  def show
+  end
+
+  private
+
+  def authorize
+    set_variables_in_authorize!
+  end
+end
+"#,
+        ),
+        (
+            "app/models/project.rb",
+            "class Project < ApplicationRecord\nend\n",
+        ),
+        ("app/views/projects/show.html.erb", "<p><%= @project&.name %></p>\n"),
+        ("db/schema.rb", SCHEMA_RB),
+    ]);
+
+    let unresolved = ivar_unresolved_names(&app);
+    assert!(
+        !unresolved.iter().any(|n| n == "project"),
+        "@project should resolve through ProcoreController::Streaming, a SIBLING \
+         module declared in the same file as ProcoreController::LegacyBase (not a \
+         lexical descendant of it) — this is the shape `nested_under` used to drop; \
+         unresolved = {unresolved:?}"
+    );
+
+    let view = app
+        .views
+        .iter()
+        .find(|v| v.name.as_str() == "projects/show")
+        .expect("projects/show view");
+    let mut reads = Vec::new();
+    collect_ivar_reads(&view.body, &mut reads);
+    let ty = ivar_read_ty(&reads, "project").expect("@project read carries a type");
+    match ty {
+        Ty::Class { id, .. } => assert_eq!(id.0.as_str(), "Project"),
+        other => panic!("expected @project : Project, got {other:?}"),
+    }
+}

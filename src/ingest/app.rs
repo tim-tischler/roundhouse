@@ -3272,15 +3272,45 @@ pub(super) fn read_rb_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResul
     Ok(out)
 }
 
-/// The classes from `classes` that are NESTED under `outer` — the ones
-/// a model's or controller's own body walk skipped. The outer class
-/// itself is ingested by its own pass and must not be registered twice.
+/// Every class/module `ingest_library_classes` found in a model's or
+/// controller's own FILE, minus `outer` itself — the outer class is
+/// ingested by its own specialized pass (`ingest_model`/
+/// `ingest_controller`) and must not be registered twice as a plain
+/// library class.
+///
+/// Despite the name, "nested under" was never literal: a class the
+/// model/controller walk skips because it isn't the chosen class can
+/// be a genuine lexical child (`class LoginController; class
+/// SomeNestedThing; end; end`, qualified `LoginController::
+/// SomeNestedThing`) OR a SIBLING declared in the same enclosing
+/// module in the same file (`module ProcoreController; class
+/// LegacyBase < ...; end; module Streaming; def
+/// set_variables_in_authorize!; ...; end; end; end`, qualified
+/// `ProcoreController::Streaming` — no `LegacyBase::` segment at all,
+/// because Ruby scopes a `module`/`class` declaration to its own
+/// lexical nesting, not to whichever sibling class happens to sit next
+/// to it in the file). `ingest_library_classes` already resolves each
+/// item's REAL qualified name from the file's own lexical scope, so
+/// the only filtering needed here is excluding the one entry that
+/// duplicates `outer`.
+///
+/// The previous `starts_with("{outer}::")` filter silently dropped
+/// every same-file sibling (module or class) that wasn't a lexical
+/// descendant of `outer` — Procore's `ProcoreController::Streaming`,
+/// living beside `ProcoreController::LegacyBase` in `legacy_base.rb`
+/// and carrying `set_variables_in_authorize!`/`set_project_variables!`/
+/// `set_company_variables!`, was one such casualty: every controller
+/// that (transitively) includes it lost those methods' bodies
+/// entirely, which made `@project`/`@company` resolve for only a
+/// sliver of Procore's controllers even after `collect_transitive_
+/// filter_ivars` learned to follow concern/parent-controller call
+/// chains — the chain had nothing to follow into, because the callee
+/// was never ingested in the first place.
 fn nested_under(
     outer: &crate::ident::ClassId,
     classes: Vec<crate::dialect::LibraryClass>,
 ) -> Vec<crate::dialect::LibraryClass> {
-    let prefix = format!("{}::", outer.0.as_str());
-    classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
+    classes.into_iter().filter(|c| &c.name != outer).collect()
 }
 
 /// The support roots to walk for library classes: every `app/*`
