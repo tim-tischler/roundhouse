@@ -492,3 +492,60 @@ fn enum_keyword_hash_mapping_predicate_runs() {
         .run_test("test/controllers/articles_controller_test.rb")
         .assert_passes();
 }
+
+/// Invariant 6's other half for the controller `class << self` fix:
+/// ingest now models a controller's singleton-block defs (`Controller::
+/// class_methods`, see `src/dialect.rs` and `ingest::controller`) well
+/// enough for `self.class.<method>` to dispatch during analysis — but
+/// dispatching during analysis is a typing fact, not a runtime one. No
+/// emitter reads `Controller::class_methods` today, so the Ruby target
+/// does not re-declare these as `def self.x` on the emitted class.
+/// Overlays a `class << self; def project_area?; … end; end` onto
+/// `ApplicationController`, has `ArticlesController#index` read it
+/// through `self.class.project_area?`, and renders the result — the
+/// same "read it back from the response" shape as
+/// `enum_keyword_hash_mapping_predicate_runs` above, so a silent
+/// drop can't pass by accident.
+#[test]
+#[ignore = "honest gap, not a regression: Controller::class_methods is ingest+analyze only (dispatch typing), no emitter reproduces it as `def self.x` yet. Confirmed failure: \"undefined method `project_area?' for class ArticlesController\" — `check` is clean (ingest+analyze resolve the call), the emitted class just never got the method. See AGENTS.md invariant 6 and the field doc on Controller::class_methods."]
+fn a_controllers_singleton_class_method_is_callable_from_an_action() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  \
+             class << self\n    \
+               def project_area?\n      \
+                 name.include?(\"Articles\")\n    \
+               end\n  \
+             end\n\n",
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "  def index\n    @articles = Article.includes(:comments).order(created_at: :desc)\n  end\n",
+            "  def index\n    @articles = Article.includes(:comments).order(created_at: :desc)\n    @project_area = self.class.project_area?\n  end\n",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<h1 class=\"font-bold text-4xl\">Articles</h1>",
+            "<h1 class=\"font-bold text-4xl\">Articles</h1>\n    <p id=\"project-area-predicate\"><%= @project_area %></p>",
+        )
+        .write(
+            // Emission routes a test file by its CLASS, not its source
+            // path: an `ActionDispatch::IntegrationTest` subclass lands
+            // in the emitted `test/models/` alongside `article_test.rb`
+            // (confirmed by inspecting the emitted tree), same as the
+            // other `*_test.rb` files this harness writes ad hoc.
+            "test/controllers/articles_controller_project_area_test.rb",
+            "require \"test_helper\"\n\n\
+             class ArticlesControllerProjectAreaTest < ActionDispatch::IntegrationTest\n  \
+               test \"the controller's own class method is readable from the action\" do\n    \
+                 get articles_url\n    \
+                 assert_response :success\n    \
+                 assert_select \"#project-area-predicate\", \"true\"\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/articles_controller_project_area_test.rb")
+        .assert_passes();
+}

@@ -334,6 +334,7 @@ fn controller(
         body: items,
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        class_methods: Vec::new(),
     }
 }
 

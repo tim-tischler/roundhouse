@@ -891,6 +891,30 @@ pub struct Controller {
     /// re-declares these ahead of the controller class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sibling_classes: Vec<(Symbol, Symbol)>,
+    /// Class-side methods declared in a `class << self … end` block in
+    /// the controller's own class body — `ProcoreController::LegacyBase`'s
+    /// `project_area?` / `company_area?` / `current_company`, etc. (see
+    /// `ingest::model::ingest_singleton_class_methods`, which this reuses).
+    ///
+    /// NOT part of `body`: a singleton block isn't one source-ordered
+    /// statement with a position of its own among actions/filters, so
+    /// (like `sibling_classes`) it is split out as existence facts
+    /// rather than threaded into the interleaved body. Consumed by
+    /// `analyze::harvest_method_returns` so `self.class.project_area?`
+    /// dispatches against a real `class_methods` entry instead of
+    /// failing to resolve — the whole reason this field exists.
+    ///
+    /// Purely a typing fact today: no emitter reproduces these as
+    /// `def self.x` in the emitted class. A diagnostic that reported
+    /// `class << self` in a controller as unsupported is gone (see
+    /// invariant 6 in AGENTS.md), but "gone" here means "modeled for
+    /// dispatch," not "proven to run" — that claim needs its own
+    /// `tests/emit_and_run.rs` case once an emitter actually re-declares
+    /// these, which none currently does. Ledger the gap rather than
+    /// hide it: a target reading this field for emission purposes before
+    /// that lands would be silently reproducing a lie.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_methods: Vec<MethodDef>,
 }
 
 /// What `layout` was declared at the controller class level.

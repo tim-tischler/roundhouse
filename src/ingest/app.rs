@@ -4587,6 +4587,7 @@ fn synthesize_redirect_controller(
         body,
         layout: crate::dialect::LayoutDecl::default(),
         sibling_classes: Vec::new(),
+        class_methods: Vec::new(),
     }
 }
 

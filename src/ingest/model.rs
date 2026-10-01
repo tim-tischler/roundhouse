@@ -872,12 +872,13 @@ fn enum_affixes(elements: &ruby_prism::NodeList<'_>, column: &str) -> (String, S
     (prefix, suffix)
 }
 
-/// Expand a model's `class << self … end` into the class methods it
-/// declares. Only `def`s are recognized: a visibility marker or an
-/// `attr_accessor` in there means something about the *singleton*
-/// scope that a flattened list of methods can't carry, so refuse it
-/// loudly rather than silently apply it to the instance side.
-fn ingest_singleton_class_methods(
+/// Expand a model's (or controller's — see `ingest::controller`) `class
+/// << self … end` into the class methods it declares. Only `def`s are
+/// recognized: a visibility marker or an `attr_accessor` in there means
+/// something about the *singleton* scope that a flattened list of
+/// methods can't carry, so refuse it loudly rather than silently apply
+/// it to the instance side.
+pub(super) fn ingest_singleton_class_methods(
     sc: &ruby_prism::SingletonClassNode<'_>,
     file: &str,
 ) -> IngestResult<Vec<crate::dialect::MethodDef>> {

@@ -101,6 +101,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
     let mut comments = collect_comments(&result);
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body_items: Vec<ControllerBodyItem> = Vec::new();
+    let mut class_methods: Vec<crate::dialect::MethodDef> = Vec::new();
     let mut layout = LayoutDecl::Inherit;
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
@@ -157,6 +158,33 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
+            // `class << self … end` — same construct model ingest
+            // expands into class methods (`ingest_model`'s singleton
+            // handling, in ingest/model.rs); reused here rather than
+            // duplicated, since the accepted shapes (bare `def`,
+            // `private`/`protected`/`public` markers, `deprecate`,
+            // `alias_method`) are identical either way. Unlike a
+            // model's, a controller's `ControllerBodyItem` has no
+            // class-receiver variant (`Action` carries no receiver
+            // field), so the resulting methods go to the side-list
+            // `class_methods` instead of interleaving into `body` —
+            // see the field's doc comment on why that's still enough
+            // for `self.class.<method>` to dispatch.
+            if let Some(sc) = stmt.as_singleton_class_node() {
+                match super::model::ingest_singleton_class_methods(&sc, file) {
+                    Ok(methods) => {
+                        class_methods.extend(methods);
+                        prev_end = Some(stmt.location().end_offset());
+                        continue;
+                    }
+                    Err(err) if super::survey::is_active() => {
+                        super::survey::record(&err);
+                        prev_end = Some(stmt.location().end_offset());
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             // `Failures = T.type_alias { … }` in a controller body is
             // the same type-only constant it is in a class body, and
             // goes the same way — here rather than in the item
@@ -189,6 +217,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         body: body_items,
         layout,
         sibling_classes,
+        class_methods,
     }))
 }
 

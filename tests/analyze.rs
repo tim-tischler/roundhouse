@@ -446,6 +446,7 @@ fn actions_without_db_calls_stay_pure() {
             }],
             layout: Default::default(),
             sibling_classes: Vec::new(),
+            class_methods: Vec::new(),
         });
         analyzer.analyze(&mut app);
         app.controllers[0].actions().next().unwrap().effects.clone()
@@ -767,6 +768,7 @@ fn analyze_action_body(body: roundhouse::expr::Expr) -> roundhouse::expr::Expr {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        class_methods: Vec::new(),
     });
     let mut analyzer = Analyzer::new(&app);
     analyzer.analyze(&mut app);

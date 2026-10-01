@@ -3379,8 +3379,12 @@ impl Analyzer {
         // sibling call (`@story = find_story`) resolves. Conservative like
         // library classes — only concrete (non-Var) bodies are registered;
         // an untypeable helper stays unresolved rather than masking to
-        // Untyped. All controller methods are instance methods (Action has
-        // no class-receiver variant).
+        // Untyped. Every `ControllerBodyItem`/`Action` is an instance
+        // method (`Action` carries no receiver field) — but a `class <<
+        // self` block in the controller's own class body is ingested
+        // separately into `Controller::class_methods` (see its doc
+        // comment), harvested just below the same way a library class's
+        // `MethodReceiver::Class` methods are.
         for controller in &app.controllers {
             let class_id = &controller.name;
             for action in controller.actions() {
@@ -3395,6 +3399,22 @@ impl Analyzer {
                 let target =
                     &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
                 Self::insert_inferred_return(target, &action.name, body_ty);
+            }
+            // Register existence even when the body can't be typed —
+            // same rationale as the library-class loop above: these
+            // `def`s are real (ingested from a `class << self` block),
+            // so `self.class.project_area?` should resolve to the
+            // inferred return or to Untyped (gradual), never to "no
+            // known method". That dispatch (not the return type) is
+            // the whole point: without an entry here, `cls.class_methods
+            // .get(method)` in `body/send.rs`'s ancestor walk misses,
+            // and `self.class.<method>` fails to dispatch even though
+            // the method is right there in the source.
+            for method in &controller.class_methods {
+                let ret = self.method_return_ty(class_id, method);
+                let target =
+                    &mut self.classes.entry(class_id.clone()).or_default().class_methods;
+                Self::register_method_return(target, &method.name, ret.as_ref());
             }
         }
 

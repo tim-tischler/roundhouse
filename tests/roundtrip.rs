@@ -100,6 +100,7 @@ fn tiny_blog_round_trips() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        class_methods: Vec::new(),
     };
 
     let routes = RouteTable {
