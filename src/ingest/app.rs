@@ -2815,9 +2815,16 @@ fn expand_class_body_macros(app: &mut App) {
                 push_block_helper(&mut expanded, &controller.name, &block_method, block_body);
             }
 
-            if expansion.filters.is_empty() {
+            // A wrap-noop already earned its own quiet ledger line
+            // above and is fully handled — dropped rather than
+            // round-tripped, same as every other `Unknown` controller
+            // item (nothing replays one today). Keeping it here would
+            // only feed `report_unrecognized_controller_macros` a
+            // second, generic "not recognized" line for the exact same
+            // call.
+            if expansion.filters.is_empty() && !expansion.wrap_noop {
                 expanded.push(item);
-            } else {
+            } else if !expansion.filters.is_empty() {
                 let mut comments = leading_comments.clone();
                 let mut blank = *leading_blank_line;
                 for filter in expansion.filters {
