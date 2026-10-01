@@ -494,20 +494,21 @@ fn enum_keyword_hash_mapping_predicate_runs() {
 }
 
 /// Invariant 6's other half for the controller `class << self` fix:
-/// ingest now models a controller's singleton-block defs (`Controller::
+/// ingest models a controller's singleton-block defs (`Controller::
 /// class_methods`, see `src/dialect.rs` and `ingest::controller`) well
-/// enough for `self.class.<method>` to dispatch during analysis — but
-/// dispatching during analysis is a typing fact, not a runtime one. No
-/// emitter reads `Controller::class_methods` today, so the Ruby target
-/// does not re-declare these as `def self.x` on the emitted class.
-/// Overlays a `class << self; def project_area?; … end; end` onto
-/// `ApplicationController`, has `ArticlesController#index` read it
-/// through `self.class.project_area?`, and renders the result — the
-/// same "read it back from the response" shape as
+/// enough for `self.class.<method>` to dispatch during analysis, and
+/// the Ruby lowering (`push_controller_class_methods` in
+/// `src/lower/controller_to_library/mod.rs`) now carries those methods
+/// into the emitted class the same way a model's `push_user_methods`
+/// does — `MethodReceiver::Class` drives generic `def self.x` emission
+/// (`emit_method` in `src/emit/ruby/library.rs`) same as it always has
+/// for models. Overlays a `class << self; def project_area?; … end;
+/// end` onto `ApplicationController`, has `ArticlesController#index`
+/// read it through `self.class.project_area?`, and renders the result —
+/// the same "read it back from the response" shape as
 /// `enum_keyword_hash_mapping_predicate_runs` above, so a silent
 /// drop can't pass by accident.
 #[test]
-#[ignore = "honest gap, not a regression: Controller::class_methods is ingest+analyze only (dispatch typing), no emitter reproduces it as `def self.x` yet. Confirmed failure: \"undefined method `project_area?' for class ArticlesController\" — `check` is clean (ingest+analyze resolve the call), the emitted class just never got the method. See AGENTS.md invariant 6 and the field doc on Controller::class_methods."]
 fn a_controllers_singleton_class_method_is_callable_from_an_action() {
     emit_and_run::real_blog()
         .edit(
@@ -547,5 +548,63 @@ fn a_controllers_singleton_class_method_is_callable_from_an_action() {
              end\n",
         )
         .run_test("test/models/articles_controller_project_area_test.rb")
+        .assert_passes();
+}
+
+/// The other half of invariant 6's `def self.x` fix: a bare `def
+/// self.x` written directly in a controller's own class body, no
+/// `class << self` wrapper. `ingest_controller_body_item`'s `def`-node
+/// arm used to build a routable `Action` for ANY `def` regardless of
+/// receiver — so this shape used to ingest as an ordinary instance
+/// action (never routed, and absent from `class_methods`, so
+/// `self.class.<name>` or `ArticlesController.<name>` wouldn't resolve
+/// it either). Fixed in `ingest::controller::ingest_controller`, which
+/// now checks `def.receiver()` before falling through to
+/// `ingest_controller_body_item`, reusing model ingest's `ingest_method`
+/// (already receiver-aware) the same way the `class << self` branch
+/// reuses `ingest_singleton_class_methods` — see
+/// `src/ingest/controller.rs`. Declares `def self.helper_name` straight
+/// on `ArticlesController` and reads it back through the bare
+/// `ArticlesController.helper_name` constant-receiver call shape (as
+/// opposed to `self.class.<name>`, which the singleton-block test above
+/// already covers), so both dispatch paths onto a controller's
+/// class-side method are pinned.
+#[test]
+fn a_controllers_bare_def_self_class_method_is_callable_from_an_action() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "class ArticlesController < ApplicationController\n",
+            "class ArticlesController < ApplicationController\n  \
+             def self.helper_name\n    \
+               \"Articles\"\n  \
+             end\n\n",
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "  def index\n    @articles = Article.includes(:comments).order(created_at: :desc)\n  end\n",
+            "  def index\n    @articles = Article.includes(:comments).order(created_at: :desc)\n    @helper_name = ArticlesController.helper_name\n  end\n",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<h1 class=\"font-bold text-4xl\">Articles</h1>",
+            "<h1 class=\"font-bold text-4xl\">Articles</h1>\n    <p id=\"helper-name\"><%= @helper_name %></p>",
+        )
+        .write(
+            // Same routing note as `articles_controller_project_area_
+            // test.rb` above: emission routes by CLASS, so this
+            // `ActionDispatch::IntegrationTest` subclass lands in the
+            // emitted `test/models/`.
+            "test/controllers/articles_controller_helper_name_test.rb",
+            "require \"test_helper\"\n\n\
+             class ArticlesControllerHelperNameTest < ActionDispatch::IntegrationTest\n  \
+               test \"a bare def self.x on the controller is readable from the action\" do\n    \
+                 get articles_url\n    \
+                 assert_response :success\n    \
+                 assert_select \"#helper-name\", \"Articles\"\n  \
+               end\n\
+             end\n",
+        )
+        .run_test("test/models/articles_controller_helper_name_test.rb")
         .assert_passes();
 }

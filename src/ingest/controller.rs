@@ -185,6 +185,34 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                     Err(err) => return Err(err),
                 }
             }
+            // A direct `def self.x` (no `class << self` block) is the
+            // same class-receiver method, just written without the
+            // wrapper. `ingest_controller_body_item`'s `def`-node arm
+            // always builds a routable `Action` and never reads
+            // `def.receiver()`, so this used to be mis-ingested as an
+            // ordinary instance action — wrong twice over: Rails never
+            // routes to it, and `self.class.<name>` wouldn't find it in
+            // `class_methods`. Reuse the same model-ingest `ingest_method`
+            // the singleton-block path calls per-`def` (it already
+            // derives `MethodReceiver` from `def.receiver()`), and file
+            // the result on the same side-list as `class << self`.
+            if let Some(def) = stmt.as_def_node() {
+                if def.receiver().is_some() {
+                    match super::model::ingest_method(&def, file) {
+                        Ok(method) => {
+                            class_methods.push(method);
+                            prev_end = Some(stmt.location().end_offset());
+                            continue;
+                        }
+                        Err(err) if super::survey::is_active() => {
+                            super::survey::record(&err);
+                            prev_end = Some(stmt.location().end_offset());
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
             // `Failures = T.type_alias { … }` in a controller body is
             // the same type-only constant it is in a class body, and
             // goes the same way — here rather than in the item

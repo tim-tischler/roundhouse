@@ -1281,7 +1281,31 @@ fn build_methods(
         }
     }
 
+    push_controller_class_methods(&mut methods, controller);
+
     methods
+}
+
+/// Carry a controller's own class-side methods (`class << self … end`,
+/// or a direct `def self.x` — both land on `Controller::class_methods`
+/// at ingest, see `src/ingest/controller.rs`) into the library class's
+/// method list, same as a model's `push_user_methods` does for
+/// `Model::body`. `MethodReceiver::Class` already drives generic
+/// `def self.x` emission (`emit_method` in
+/// `src/emit/ruby/library.rs`) and strict-target stubbing the same way
+/// it does for every other class method — these just need to be
+/// present in `methods` to get it. Skips a name a synthesized method
+/// (route helper, params accessor, …) already defined, mirroring the
+/// model-side guard; the corpus doesn't collide a `class << self` def
+/// with a synthesized name, but silently shadowing one would be worse
+/// than dropping the duplicate.
+fn push_controller_class_methods(methods: &mut Vec<MethodDef>, controller: &Controller) {
+    for m in &controller.class_methods {
+        if methods.iter().any(|existing| existing.name == m.name && existing.receiver == m.receiver) {
+            continue;
+        }
+        methods.push(m.clone());
+    }
 }
 
 /// Names a controller marks with `helper_method :x` whose public
