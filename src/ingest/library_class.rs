@@ -2163,7 +2163,7 @@ pub fn ingest_concern_filters(
             for inner in flatten_statements(block_body) {
                 if let Some(fs) = super::controller::parse_filter_call(&inner, file) {
                     filters.extend(fs);
-                } else if let Some(f) = block_form_concern_filter(&inner, file) {
+                } else if let Some(f) = unresolved_filter_call_passthrough(&inner, file) {
                     filters.push(f);
                 }
             }
@@ -2175,26 +2175,46 @@ pub fn ingest_concern_filters(
     out
 }
 
-/// A block-form filter in a concern's `included do` — campfire's
-/// `SetCurrentRequest` is nothing but `before_action do Current.request =
-/// request end`. `parse_filter_call` returns `None` for it (no symbol
-/// target), so it fell off the chain entirely: the splice never carried
-/// it into any controller, the trace never listed it, and the emitted
-/// controllers never set `Current.request`. Captured here as a `Filter`
-/// whose `block` is the whole call, kept IN ORDER among the named
-/// filters; the splice turns it back into the `Unknown` body item a
-/// controller's own block-form filter is, so one lowering serves both.
-/// The `__block__` target is a placeholder the splice never emits.
-fn block_form_concern_filter(stmt: &ruby_prism::Node<'_>, file: &str) -> Option<crate::dialect::Filter> {
+/// A filter-named call in a concern's `included do` that
+/// `parse_filter_call` could not resolve into Filters with concrete
+/// Symbol targets — a block-form call (campfire's `SetCurrentRequest`
+/// is nothing but `before_action do Current.request = request end`,
+/// the original and still most common shape here), a lambda/proc
+/// ARGUMENT-form call (`before_action -> { … }, only: […]`), or an
+/// unresolvable splat (`skip_before_action(*DocumentMarkup::Jwt::
+/// TRADITIONAL_AUTHENTICATION_METHODS, only: […])`, Procore's
+/// `DocumentMarkup::Viewer`). Every one of these used to vanish
+/// SILENTLY the moment it sat inside `included do`:
+/// `ingest_concern_filters`'s loop had no fallback once
+/// `parse_filter_call` returned `None`, so nothing about the call ever
+/// reached any controller's body, let alone a ledger line — worse than
+/// the same shape written directly in a controller, which at least
+/// stayed `Unknown` and reached `report_unrecognized_controller_
+/// macros`. Captured here as a `Filter` whose `block` is the WHOLE
+/// call, kept IN ORDER among the named filters; the splice
+/// (`splice_concerns_into_controllers`) turns it back into the
+/// `Unknown` body item a controller's own unresolved filter call would
+/// be, so the including controller's body ends up identical either
+/// way — `ingest::controller::lambda_filter_target`,
+/// `resolve_const_splat_filters`, and (failing both) the generic
+/// ledger line all already know what to do with it from there. The
+/// `__block__` target is a placeholder the splice never emits.
+fn unresolved_filter_call_passthrough(
+    stmt: &ruby_prism::Node<'_>,
+    file: &str,
+) -> Option<crate::dialect::Filter> {
     use crate::dialect::{Filter, FilterKind};
     let call = stmt.as_call_node()?;
-    if call.receiver().is_some() || call.block().is_none() {
+    if call.receiver().is_some() {
         return None;
     }
     let kind = match constant_id_str(&call.name()) {
         "before_action" => FilterKind::Before,
         "around_action" => FilterKind::Around,
         "after_action" => FilterKind::After,
+        "skip_before_action" => FilterKind::Skip,
+        "skip_around_action" => FilterKind::SkipAround,
+        "skip_after_action" => FilterKind::SkipAfter,
         _ => return None,
     };
     let expr = ingest_expr(stmt, file).ok()?;

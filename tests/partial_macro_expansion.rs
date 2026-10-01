@@ -393,3 +393,154 @@ fn a_name_the_walk_did_ingest_a_body_for_keeps_the_original_generic_line() {
         "should not ALSO claim a gem origin once the app itself defines the name: {messages:?}"
     );
 }
+
+// ── 5. The rest of the Rails/Ruby core vocabulary exclusion ──────────
+// A full Procore run surfaced four more names the gem heuristic
+// misfired on beyond `protect_from_forgery`: `class_attribute`,
+// `prepend_around_action`, `wrap_parameters`, and `require`. None of
+// these are consumed elsewhere (their effect really is dropped, same
+// as before this feature existed), so they must still read as the
+// original generic "not recognized" line — just never as a gem.
+
+#[test]
+fn rails_and_ruby_core_vocabulary_is_never_blamed_on_a_gem() {
+    let messages = survey_messages(tree(&[
+        ("Gemfile.lock", GEMFILE_LOCK_WITH_UNKNOWN_GEM),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  \
+               class_attribute :foo\n  \
+               prepend_around_action :bar\n  \
+               wrap_parameters :baz\n  \
+               require 'set'\nend\n",
+        ),
+    ]));
+    for name in ["class_attribute", "prepend_around_action", "wrap_parameters", "require"] {
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("controller class-body macro not recognized") && m.contains(name)),
+            "expected `{name}` to keep the original generic line: {messages:?}"
+        );
+    }
+    assert!(
+        !messages.iter().any(|m| m.contains("unmodeled gem") || m.contains("not defined in the app")),
+        "none of Ruby's or Rails' own vocabulary should ever read as a gem or as \"not defined in the app\": {messages:?}"
+    );
+}
+
+// ── 6. A splat-of-constant filter target resolves post-ingest ────────
+// `skip_before_action(*SomeConst, only: [...])` is ordinary Rails —
+// the macro runs with the constant's REAL value at class-definition
+// time — but `parse_filter_call` (ingest, one file at a time) can
+// never resolve `SomeConst` against another file's constant. This is
+// exactly `document_markup/viewer.rb`'s
+// `skip_before_action(*DocumentMarkup::Jwt::TRADITIONAL_AUTHENTICATION_METHODS,
+// only: [...])` on the real Procore corpus, reproduced here with a
+// synthetic constant.
+
+const JWT_CONST_SOURCE: &str = r#"
+module DocumentMarkup
+  class Jwt
+    TRADITIONAL_AUTHENTICATION_METHODS = [:authorize, :verify_authenticity_token, :ensure_accepted_terms_and_conditions].freeze
+  end
+end
+"#;
+
+#[test]
+fn a_splat_of_a_resolvable_constant_expands_to_real_filter_targets() {
+    let app = ingest_app_from_tree(tree(&[
+        ("app/services/document_markup/jwt.rb", JWT_CONST_SOURCE),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  \
+               skip_before_action(*DocumentMarkup::Jwt::TRADITIONAL_AUTHENTICATION_METHODS, only: [:jwt_file])\n\n  \
+               def jwt_file\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let c = controller(&app, "ThingsController");
+    let fs = filters(c);
+    let targets: Vec<String> =
+        fs.iter().filter(|f| f.kind == FilterKind::Skip).map(|f| f.target.as_str().to_string()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "authorize".to_string(),
+            "verify_authenticity_token".to_string(),
+            "ensure_accepted_terms_and_conditions".to_string()
+        ],
+        "the splat should expand to the constant's three real elements, in order: {fs:?}"
+    );
+    assert!(
+        fs.iter().all(|f| f.only.len() == 1 && f.only[0].as_str() == "jwt_file"),
+        "the `only:` scoping must apply to every target the splat expanded to: {fs:?}"
+    );
+}
+
+#[test]
+fn a_splat_of_a_resolvable_constant_inside_a_concerns_included_do_block_also_resolves() {
+    // The actual Procore shape: the splat-target `skip_before_action`
+    // lives in a CONCERN's `included do` block, not directly in the
+    // controller — it must be spliced into the controller's own body
+    // before this resolves, with no special-casing needed for the
+    // splice origin.
+    let app = ingest_app_from_tree(tree(&[
+        ("app/services/document_markup/jwt.rb", JWT_CONST_SOURCE),
+        (
+            "app/controllers/concerns/viewer.rb",
+            "module Viewer\n  extend ActiveSupport::Concern\n\n  included do\n    \
+               skip_before_action(*DocumentMarkup::Jwt::TRADITIONAL_AUTHENTICATION_METHODS, only: [:jwt_file])\n  \
+               end\nend\n",
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  include Viewer\n\n  def jwt_file\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    // The splice lands in the INCLUDING class's own body — exactly
+    // `ProjectArea::MergedPdfsController`'s real shape, which includes
+    // `ImageProcessingAuthentication::PayloadVerification` directly
+    // rather than through an ancestor. A subclass inheriting the
+    // concern transitively picks up the filter through the ancestor
+    // chain at analyze time, a separate mechanism this test isn't
+    // after.
+    let c = controller(&app, "ThingsController");
+    let fs = filters(c);
+    assert_eq!(
+        fs.iter().filter(|f| f.kind == FilterKind::Skip).count(),
+        3,
+        "the spliced-in splat should expand the same way it would directly in the controller: {fs:?}"
+    );
+}
+
+#[test]
+fn a_splat_of_an_unresolvable_constant_still_falls_back_honestly() {
+    let messages = survey_messages(tree(&[
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  \
+               skip_before_action(*SomeUnknownModule::NOT_A_REAL_CONST, only: [:jwt_file])\n\n  \
+               def jwt_file\n  end\nend\n",
+        ),
+    ]));
+    assert!(
+        messages.iter().any(|m| {
+            m.contains("controller class-body macro not recognized") && m.contains("skip_before_action")
+        }),
+        "an unresolvable splat must still fall back to the honest generic line, not be silently dropped: {messages:?}"
+    );
+}

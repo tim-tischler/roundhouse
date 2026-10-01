@@ -1410,6 +1410,14 @@ end
     // After the splice: a macro has to resolve against the concern's
     // class-side methods, and its expansion joins the same filter chain.
     expand_class_body_macros(&mut app);
+    // A splat-of-constant filter target (`skip_before_action(*Jwt::
+    // TRADITIONAL_AUTHENTICATION_METHODS, only: [...])`) needs the
+    // WHOLE app's constants to resolve, which only exists now — after
+    // every file, including the one that defines the constant, is
+    // ingested. Runs after the splice and the macro expansion above so
+    // it sees every controller's FINAL body, concern-spliced items
+    // included.
+    resolve_const_splat_filters(&mut app);
     // The same idea one base over: `const` / `prop` under a class
     // whose ancestry a sidecar says reaches `T::Props` IS the
     // `T::Struct` macro, and gets expanded rather than replayed. It
@@ -2269,17 +2277,34 @@ const REFINEMENT_MACROS: &[&str] = &["using"];
 /// this walk's shape-recognizers failed to place" apart from "a name
 /// nothing here defines" — the latter can only be a gem's or Rails'
 /// own DSL, since the app had to compile against SOMETHING.
-/// Rails/ActionController's own filter macros. A call to one of these
-/// reaching the generic bucket means the NAME is recognized but the
-/// particular SHAPE isn't (`protect_from_forgery with: :null_session`,
-/// say — `parse_forgery_macro` only models the `:exception` strategy) —
-/// roundhouse's own coverage gap, not evidence of a gem. Neither
-/// `all_defined_method_names` nor any `Gemfile.lock` will ever contain
-/// these (Rails itself is never "ingested" as app source), so without
-/// this exclusion every one of them would misfire the gem heuristic —
-/// exactly what happened to `protect_from_forgery` before this list
-/// existed, see the PR notes.
+/// Ruby's own and Rails/ActiveSupport/ActionController's own
+/// class-body vocabulary that can still reach the generic bucket
+/// (i.e. is NOT already fully handled by `CONSUMED_CONTROLLER_MACROS`
+/// or `REFINEMENT_MACROS` above, which never reach this point at all).
+/// A call to one of these reaching the generic bucket means the NAME
+/// is recognized but the particular SHAPE isn't modeled
+/// (`protect_from_forgery with: :null_session`, say —
+/// `parse_forgery_macro` only models the `:exception` strategy, or
+/// `class_attribute`/`wrap_parameters`, whose class-level configuration
+/// this analyzer doesn't track at all) — roundhouse's own coverage
+/// gap, not evidence of a gem. Neither `all_defined_method_names` nor
+/// any `Gemfile.lock` will ever contain these (Ruby and Rails are
+/// never "ingested" as app source), so without this exclusion every
+/// one of them would misfire the gem heuristic — exactly what
+/// happened to `protect_from_forgery`, `class_attribute`,
+/// `prepend_around_action`, `wrap_parameters`, and `require` on a full
+/// Procore run before this list covered them, see the PR notes.
+///
+/// Not exhaustive by construction (there is no enumerable "every name
+/// Ruby or Rails defines" to check against) — it is the observed set
+/// plus its obvious siblings (every `before_action` family member:
+/// skip/prepend/append, every `cattr`/`mattr`/`thread_mattr` variant).
+/// A name that slips through still reads as "not recognized," the
+/// same honest bucket it would have read as before gem attribution
+/// existed — this list only prevents FALSE gem claims, it never
+/// changes the fallback a miss lands on.
 const RAILS_CORE_FILTER_MACROS: &[&str] = &[
+    // The filter-callback family and its skip/prepend/append variants.
     "before_action",
     "after_action",
     "around_action",
@@ -2287,8 +2312,39 @@ const RAILS_CORE_FILTER_MACROS: &[&str] = &[
     "skip_around_action",
     "skip_after_action",
     "prepend_before_action",
+    "prepend_after_action",
+    "prepend_around_action",
+    "append_before_action",
+    "append_after_action",
+    "append_around_action",
     "protect_from_forgery",
     "skip_forgery_protection",
+    // ActiveSupport class-level attribute declarations.
+    "class_attribute",
+    "cattr_accessor",
+    "cattr_reader",
+    "cattr_writer",
+    "mattr_accessor",
+    "mattr_reader",
+    "mattr_writer",
+    "thread_mattr_accessor",
+    "thread_mattr_reader",
+    "thread_mattr_writer",
+    "thread_cattr_accessor",
+    "thread_cattr_reader",
+    "thread_cattr_writer",
+    // Other ActionController class-body macros this analyzer doesn't
+    // model the effect of.
+    "wrap_parameters",
+    "respond_to",
+    "serialization_scope",
+    "etag",
+    "fresh_when",
+    // Plain Ruby, not Rails at all, but same reasoning: never ingested
+    // as app source, never a gem's DSL either.
+    "require",
+    "require_relative",
+    "module_function",
 ];
 
 fn all_defined_method_names(app: &App) -> std::collections::HashSet<&str> {
@@ -2412,6 +2468,122 @@ fn report_unrecognized_controller_macros(app: &App) {
             };
             survey::record(&IngestError::Unsupported { file, message });
         }
+    }
+}
+
+/// Every app-wide constant whose value is a literal array of Symbols —
+/// optionally wrapped in a trailing `.freeze`, the common idiom
+/// (`TRADITIONAL_AUTHENTICATION_METHODS = [:authorize, :verify_authenticity_token,
+/// :ensure_accepted_terms_and_conditions].freeze`) — keyed by its fully
+/// qualified path (enclosing class/module nesting + name, `::`-joined).
+/// This is exactly the shape `*SOME_CONST` needs resolved when it is a
+/// filter macro's splat target (`skip_before_action(*Jwt::
+/// TRADITIONAL_AUTHENTICATION_METHODS, only: [...])`, completely
+/// ordinary Rails — the macro runs with the constant's real value at
+/// class-definition time). Scoped to `LibraryClass.constants` only
+/// (populated from a plain Ruby class/module's own class-body constant
+/// assignments); a model's own constants use a different representation
+/// (`ModelBodyItem::Unknown` wrapping a bare `Assign`, per
+/// `map_enum_labels`'s doc comment) and are not scanned here — no
+/// observed case needed it yet.
+fn collect_symbol_array_constants(app: &App) -> HashMap<String, Vec<crate::ident::Symbol>> {
+    use crate::expr::{ExprNode, Literal};
+
+    let array_value = |e: &crate::expr::Expr| -> Option<Vec<crate::ident::Symbol>> {
+        let inner = match &*e.node {
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "freeze" && args.is_empty() =>
+            {
+                r
+            }
+            _ => e,
+        };
+        match &*inner.node {
+            ExprNode::Array { elements, .. } => elements
+                .iter()
+                .map(|el| match &*el.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    };
+
+    let mut out = HashMap::new();
+    for lc in &app.library_classes {
+        for (name, value) in &lc.constants {
+            if let Some(syms) = array_value(value) {
+                out.insert(format!("{}::{}", lc.name.0.as_str(), name.as_str()), syms);
+            }
+        }
+    }
+    out
+}
+
+/// `skip_before_action(*CONST_ARRAY, only: [...])` written DIRECTLY in
+/// a controller's own class body (as opposed to inside a concern macro
+/// — `expand_class_body_macros` handles that case via the same
+/// `filter_from_send`, threaded `const_arrays`). `parse_filter_call`,
+/// at ingest, sees one file at a time and can't resolve `CONST_ARRAY`'s
+/// value, so a splat target always left the call `Unknown`; this runs
+/// after the whole app is ingested AND after `splice_concerns_into_
+/// controllers` (so a concern's own `included do` block — `Document
+/// Markup::Viewer`'s `skip_before_action(*DocumentMarkup::Jwt::
+/// TRADITIONAL_AUTHENTICATION_METHODS, ...)` — gets the identical
+/// treatment once spliced into each including controller's own body,
+/// no special-casing needed) and before `report_unrecognized_
+/// controller_macros`, so a successful resolution never reaches the
+/// generic bucket. Filters produced this way carry `from_concern: None`
+/// — this pass only sees the SPLICED COPY in the including controller's
+/// body, with no record of which concern (if any) it originated from,
+/// a small provenance loss against the real thing (no effect on the
+/// filter chain itself, only on trace/hover attribution).
+fn resolve_const_splat_filters(app: &mut App) {
+    use crate::dialect::ControllerBodyItem;
+    use crate::expr::ExprNode;
+
+    let const_arrays = collect_symbol_array_constants(app);
+    if const_arrays.is_empty() {
+        return;
+    }
+
+    for controller in &mut app.controllers {
+        let mut expanded: Vec<ControllerBodyItem> = Vec::new();
+        for item in std::mem::take(&mut controller.body) {
+            let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = &item
+            else {
+                expanded.push(item);
+                continue;
+            };
+            let ExprNode::Send { recv: None, args, block: None, .. } = &*expr.node else {
+                expanded.push(item);
+                continue;
+            };
+            // Only worth re-running the filter parser when a splat is
+            // actually present — the common Symbol-target shape was
+            // already handled at ingest, and every OTHER Unknown item
+            // in a real app's controllers vastly outnumbers this one.
+            if !args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) {
+                expanded.push(item);
+                continue;
+            }
+            match filter_from_send(expr, None, &const_arrays) {
+                Some(filters) => {
+                    let mut comments = leading_comments.clone();
+                    let mut blank = *leading_blank_line;
+                    for filter in filters {
+                        expanded.push(ControllerBodyItem::Filter {
+                            filter,
+                            leading_comments: std::mem::take(&mut comments),
+                            leading_blank_line: std::mem::take(&mut blank),
+                        });
+                    }
+                }
+                None => expanded.push(item),
+            }
+        }
+        controller.body = expanded;
     }
 }
 
@@ -2546,6 +2718,13 @@ fn expand_class_body_macros(app: &mut App) {
         return;
     }
 
+    // A splat target resolves against this table too (`skip_before_action(
+    // *SOME_CONCERN_CONST, only: [...])` written directly inside a
+    // macro's own body, same as `resolve_const_splat_filters` resolves
+    // for a controller's own direct call — see that function's doc
+    // comment for why this needs the whole app ingested first).
+    let const_arrays = collect_symbol_array_constants(app);
+
     for controller in &mut app.controllers {
         let includes = reachable.get(&controller.name).cloned().unwrap_or_default();
         let ancestors = self_chain.get(&controller.name).cloned().unwrap_or_default();
@@ -2645,7 +2824,15 @@ fn expand_class_body_macros(app: &mut App) {
                 MacroSource::SelfMacro(module, body) => (module, body),
             };
             let mut expansion = MacroBodyExpansion::default();
-            classify_macro_body(&body, &module, &includes, &macros, MAX_MACRO_NESTING, &mut expansion);
+            classify_macro_body(
+                &body,
+                &module,
+                &includes,
+                &macros,
+                &const_arrays,
+                MAX_MACRO_NESTING,
+                &mut expansion,
+            );
 
             if !expansion.config_notes.is_empty() {
                 survey::record(&IngestError::Unsupported {
@@ -2802,6 +2989,7 @@ fn classify_macro_body(
     module: &crate::ident::ClassId,
     includes: &[crate::ident::ClassId],
     macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    const_arrays: &HashMap<String, Vec<Symbol>>,
     depth: u32,
     out: &mut MacroBodyExpansion,
 ) {
@@ -2811,7 +2999,7 @@ fn classify_macro_body(
         _ => vec![body],
     };
     for stmt in statements {
-        classify_macro_statement(stmt, module, includes, macros, depth, out);
+        classify_macro_statement(stmt, module, includes, macros, const_arrays, depth, out);
     }
 }
 
@@ -2826,12 +3014,13 @@ fn classify_macro_statement(
     module: &crate::ident::ClassId,
     includes: &[crate::ident::ClassId],
     macros: &HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>>,
+    const_arrays: &HashMap<String, Vec<Symbol>>,
     depth: u32,
     out: &mut MacroBodyExpansion,
 ) {
     use crate::expr::ExprNode;
 
-    if let Some(filters) = filter_from_send(stmt, module) {
+    if let Some(filters) = filter_from_send(stmt, Some(module.clone()), const_arrays) {
         out.filters.extend(filters);
         return;
     }
@@ -2862,7 +3051,15 @@ fn classify_macro_statement(
                     return;
                 }
                 let nested_body = substitute_params(&macro_def, args);
-                classify_macro_body(&nested_body, &nested_module, includes, macros, depth - 1, out);
+                classify_macro_body(
+                    &nested_body,
+                    &nested_module,
+                    includes,
+                    macros,
+                    const_arrays,
+                    depth - 1,
+                    out,
+                );
                 return;
             }
         }
@@ -3074,9 +3271,18 @@ fn substitute_params(
 /// to live here (`filters_from_macro_body`) but was replaced by the
 /// per-statement classifier — see `expand_class_body_macros`'s
 /// "PARTIAL EXPANSION" doc comment for why.
+///
+/// Also the one place a `*CONST` splat target can resolve at all —
+/// `parse_filter_call` (ingest, one file at a time) never has the
+/// whole app's constants to check a splat against, so it always
+/// refuses one; this function is called again, post-ingest, by
+/// `resolve_const_splat_filters` with the real `const_arrays` table,
+/// over every controller's still-`Unknown` body items — not just
+/// macro bodies.
 fn filter_from_send(
     expr: &crate::expr::Expr,
-    module: &crate::ident::ClassId,
+    from_concern: Option<crate::ident::ClassId>,
+    const_arrays: &HashMap<String, Vec<crate::ident::Symbol>>,
 ) -> Option<Vec<crate::dialect::Filter>> {
     use crate::dialect::{Filter, FilterKind};
     use crate::expr::{ExprNode, Literal};
@@ -3104,6 +3310,24 @@ fn filter_from_send(
             _ => sym_of(e).into_iter().collect(),
         }
     };
+    // `*CONST` — a splat of a module constant, completely ordinary
+    // Rails (`skip_before_action(*Jwt::TRADITIONAL_AUTHENTICATION_METHODS,
+    // only: [...])`). Rails runs this with the constant's REAL value at
+    // class-definition time, so when that value is a literal array of
+    // Symbols somewhere this app was ingested (`const_arrays`, built
+    // from every `LibraryClass`'s own `constants` list — see
+    // `collect_symbol_array_constants`), the splat is exactly as
+    // resolvable as a literal list of targets would have been. Matched
+    // on the constant's full dotted path as written at the splat's own
+    // site; a reference spelled relative to a shallower scope won't
+    // match and falls through to `None` below, same as any other
+    // unrecognized shape.
+    let splat_targets = |e: &crate::expr::Expr| -> Option<Vec<crate::ident::Symbol>> {
+        let ExprNode::Splat { value } = &*e.node else { return None };
+        let ExprNode::Const { path } = &*value.node else { return None };
+        let key = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        const_arrays.get(&key).cloned()
+    };
 
     let mut targets: Vec<(crate::ident::Symbol, crate::span::Span)> = Vec::new();
     let mut only: Vec<crate::ident::Symbol> = Vec::new();
@@ -3122,6 +3346,10 @@ fn filter_from_send(
     for arg in args {
         if let Some(sym) = sym_of(arg) {
             targets.push((sym, arg.span));
+            continue;
+        }
+        if let Some(syms) = splat_targets(arg) {
+            targets.extend(syms.into_iter().map(|s| (s, arg.span)));
             continue;
         }
         let ExprNode::Hash { entries, .. } = &*arg.node else {
@@ -3156,7 +3384,7 @@ fn filter_from_send(
                 target_span,
                 kind: kind.clone(),
                 target,
-                from_concern: Some(module.clone()),
+                from_concern: from_concern.clone(),
                 only: only.clone(),
                 except: except.clone(),
                 only_style: crate::expr::ArrayStyle::default(),
