@@ -313,6 +313,36 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
             mark(d, gem, None);
         }
     }
+
+    // Pass 1.5: a dispatch receiver whose root constant `gem_for`
+    // couldn't name-match to any gem in the lockfile, but which ALSO
+    // isn't defined anywhere in the app itself (no model, library
+    // class, or controller by that name) — the constant has to come
+    // from somewhere, and every gem the census can't otherwise explain
+    // is still "unknown" in aggregate. `namespace_of`'s name-derivation
+    // assumes a gem's top-level constant matches its (camelized) gem
+    // name; a house gem is often not spelled that way at all —
+    // `procore-instrumentation` ships `Observability`, not
+    // `ProcoreInstrumentation` or `Procore`. Rather than grow
+    // `namespace_of`'s irregular-name table one house gem at a time,
+    // attribute these generically: no specific gem to name, just the
+    // fact that *some* unmodeled dependency is the likely owner.
+    //
+    // Narrower than passes 1/2: with no gem name to propagate, this
+    // only marks the dispatch site itself, not ivars assigned from it.
+    for d in diags.iter_mut() {
+        if !eligible(&d.kind) || d.severity == Severity::Info {
+            continue;
+        }
+        let DiagnosticKind::SendDispatchFailed { recv_ty, .. } = &d.kind else { continue };
+        let Some(path) = recv_root_path(recv_ty) else { continue };
+        let head = path.split("::").next().unwrap_or(path.as_str());
+        if app_defines_constant(app, head) {
+            continue;
+        }
+        mark_generic(d, head);
+    }
+
     if sites.is_empty() {
         return;
     }
@@ -370,6 +400,31 @@ fn mark(d: &mut Diagnostic, gem: &str, via_ivar: Option<&str>) {
             " — likely roundhouse coverage, not an app error (the `{gem}` gem is in the Gemfile and roundhouse does not model it)"
         )),
     }
+}
+
+/// Same downgrade as [`mark`], for the generic (no specific gem named)
+/// attribution: the app has unmodeled gems in its lockfile and this
+/// constant isn't one the app itself defines, so an unnamed one of
+/// those gems is the likeliest owner.
+fn mark_generic(d: &mut Diagnostic, constant: &str) {
+    d.severity = Severity::Info;
+    d.message
+        .push_str(&format!(" — no known constant {constant} in the app — probably from an unmodeled gem"));
+}
+
+/// Whether the app itself declares a class or module rooted at `head`
+/// — a model, a library class (plain Ruby class/module, including
+/// mailers/jobs/workers, per `ingest::library_class`), or a
+/// controller — either exactly or as the first segment of a qualified
+/// name (`Observability::Tracing` under a bare `Observability`).
+/// `false` means the constant has to come from somewhere outside the
+/// app: a gem, however `gem_owning_constant`'s name-derivation missed
+/// it.
+fn app_defines_constant(app: &App, head: &str) -> bool {
+    let matches = |name: &str| name == head || name.starts_with(&format!("{head}::"));
+    app.models.iter().any(|m| matches(m.name.0.as_str()))
+        || app.library_classes.iter().any(|lc| matches(lc.name.0.as_str()))
+        || app.controllers.iter().any(|c| matches(c.name.0.as_str()))
 }
 
 /// The constant path of a dispatch receiver's class, unions by first
