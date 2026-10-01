@@ -71,6 +71,7 @@ pub mod mocha;
 pub mod webmock;
 pub mod global_id_locate;
 pub mod array_ordinal;
+pub mod array_wrap;
 pub mod sti_is_a;
 pub mod dead_default;
 pub mod errors_add;
@@ -321,6 +322,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `list.index_by { … }` → `ActiveSupport.index_by(list) { … }`.
     // Same receiver-shape rewrite, same absence of constraints.
     ("enumerable_ext", &[]),
+    // `Array.wrap(x)` → `ActiveSupport.wrap(x)`. Keys on a bare
+    // `Array` Const receiver and a `wrap` send, neither of which any
+    // other pass produces or consumes, so no ordering constraints.
+    ("array_wrap", &[]),
     // No runs_after: it reads only analyzer types and produces calls no other pass consumes.
     ("time_calendar", &[]),
     // After time_calendar: `t.all_month` becomes the Range literal this splits out.
@@ -726,6 +731,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("presence_in");
     enumerable_ext::apply_enumerable_ext_grounding(app);
     ran!("enumerable_ext");
+    array_wrap::apply_array_wrap_lowering(app);
+    ran!("array_wrap");
     time_calendar::apply_time_calendar_grounding(app);
     ran!("time_calendar");
     diags.extend(where_range_split::apply_where_range_split(app));

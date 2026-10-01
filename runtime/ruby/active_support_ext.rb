@@ -223,6 +223,24 @@ module ActiveSupport
     out
   end
 
+  # AS `Array.wrap(object)`: `nil` becomes `[]`; something already
+  # array-shaped (`to_ary`, which in our IR means it's already typed
+  # `Array[_]`) passes through unchanged; anything else is wrapped in a
+  # one-element Array. Rails' real definition also special-cases a
+  # receiver that responds to `to_a` but not `to_ary` (calling that
+  # instead of wrapping) — no corpus call site passes one, so that leg
+  # isn't modeled.
+  #
+  # A class-side reopen (`Array`'s singleton), same reason this lives
+  # here instead of on a real `Array` as the other container helpers
+  # above do: `lower::array_wrap` routes the `Array.wrap(x)` call site
+  # here as a receiver-shape rewrite, independent of `x`'s type.
+  def self.wrap(object)
+    return [] if object.nil?
+    return object if object.is_a?(Array)
+    [object]
+  end
+
   # AS `Array#to_sentence`: "", "a", "a and b", "a, b, and c" with the
   # :en connectors, which `lower::enumerable_ext` passes when the call
   # site names none. Another core_ext reopen (`Array`) the transpiled

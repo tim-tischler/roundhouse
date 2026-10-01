@@ -789,6 +789,22 @@ impl<'a> BodyTyper<'a> {
                 // renders natively (`parse_db_time` → `RhDateTime.parse`
                 // etc.) — so it's resolved here rather than via the class
                 // registry, which would leave it an unresolved `Ty::Var`.
+                // `ActiveModel::Type::Boolean.new.cast(x)` — the
+                // framework's own "truthy-string" coercion
+                // (`"false"`/`"0"`/`false`/`0` → `false`, everything
+                // else → `true`), reached via `.new` on an
+                // unregistered framework class: `ActiveModel::Type::
+                // Boolean` is never ingested from app source (it's
+                // ActiveModel itself, not an app class), so the
+                // registry walk below never finds it and `cast` fell
+                // through to `unknown()` however many call sites used
+                // it. Procore's own `to_bool` core_ext
+                // (`core_ext_reopen_ty`, the `Ty::Str` arm above) is
+                // the hand-rolled version of exactly this; this is
+                // the framework's.
+                if id.0.as_str() == "ActiveModel::Type::Boolean" && method.as_str() == "cast" {
+                    return Ty::Bool;
+                }
                 if id.0.as_str() == "ActiveSupport" && method.as_str() == "parse_db_time" {
                     return Ty::Union { variants: vec![Ty::Time, Ty::Nil] };
                 }
@@ -947,6 +963,23 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
+                // `Array.wrap(x)` — ActiveSupport's class-side `Array`
+                // reopen. `lower::array_wrap` rewrites the call site to
+                // `ActiveSupport.wrap(x)` for every target's emitted
+                // code (the runtime behind the type below); this arm
+                // only needs to answer what the call TYPES as. `nil`
+                // wraps to an empty Array; an already-Array argument
+                // passes through unchanged (Rails' `to_ary` check);
+                // anything else becomes a one-element Array of the
+                // argument's type.
+                if id.0.as_str() == "Array" && method.as_str() == "wrap" {
+                    return match call_args.first().and_then(|a| a.ty.clone()) {
+                        Some(Ty::Array { elem }) => Ty::Array { elem },
+                        Some(Ty::Nil) => Ty::Array { elem: Box::new(unknown()) },
+                        Some(t) => Ty::Array { elem: Box::new(t) },
+                        None => Ty::Array { elem: Box::new(unknown()) },
+                    };
+                }
                 if method.as_str() == "new" {
                     match id.0.as_str() {
                         "Hash" => {
@@ -1332,7 +1365,26 @@ impl<'a> BodyTyper<'a> {
             }
             Some(Ty::Hash { key, value }) => hash_method(method, key, value, block_ret, args),
             Some(Ty::Record { row }) => record_method(method, row, args),
-            Some(Ty::Str) => str_method(method),
+            // `str_method`'s table is Ruby-core plus ActiveSupport —
+            // closed-world by design (its own doc comment: "the
+            // authority"). An app that reopens `String` under
+            // `lib/core_ext/` (Procore's `to_bool`, `word_wrap`, …)
+            // ingests that file as an ordinary library class keyed
+            // `ClassId("String")`, typed by the same return-harvest as
+            // any other class — the registry entry exists. Dispatch
+            // on a String-typed VALUE never consulted it, so every
+            // such method read as "no known method" however many call
+            // sites used it. Only consulted on a table miss, so an
+            // app that also defines (say) `def length` can't shadow
+            // the real Ruby method the table already answers for.
+            Some(Ty::Str) => {
+                let t = str_method(method);
+                if matches!(t, Ty::Var { .. }) {
+                    self.core_ext_reopen_ty(&["String"], method).unwrap_or(t)
+                } else {
+                    t
+                }
+            }
             Some(Ty::Sym) => sym_method(method),
             // A `Ty::Time` value (datetime-column read, `Time.now`, etc.)
             // dispatches through the same table the `Time` class constant
@@ -1453,6 +1505,23 @@ impl<'a> BodyTyper<'a> {
             stack.extend(m.includes.iter().cloned());
         }
         None
+    }
+
+    /// The return type of `method` as defined by an app-level reopen of
+    /// one of Ruby's own core classes (`class String; def to_bool; …;
+    /// end; end` under `lib/core_ext/` or `app/lib/`) — consulted by a
+    /// primitive dispatch arm (`Ty::Str`, …) after its own hardcoded
+    /// table misses. `names` lists every real-Ruby class the dispatched
+    /// `Ty` could be backed by, tried in order (e.g. `Ty::Int` is
+    /// `Integer` in Ruby, but a reopen can equally sit on `Integer`'s
+    /// real ancestor `Numeric`, which the ingest has no way to link as
+    /// a parent since nothing in the app itself writes `class Integer <
+    /// Numeric`). First match wins; `lookup_in_module` already walks a
+    /// single class's own `includes`.
+    fn core_ext_reopen_ty(&self, names: &[&str], method: &Symbol) -> Option<Ty> {
+        names
+            .iter()
+            .find_map(|name| self.lookup_in_module(&ClassId(Symbol::from(*name)), method))
     }
 
     /// The bound on a dynamic `recv.send(x)` (non-literal `x`): the

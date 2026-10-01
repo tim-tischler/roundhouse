@@ -1498,7 +1498,19 @@ fn every_runtime_method_body_concretely_typed() {
     // swapping `ENV["TZ"]` for the block would have changed every
     // thread's clock. Taking the zone as `untyped` cost 8; `String?` is
     // what the corpus passes (`company.timezone_name`).
-    const CEILING: usize = 504;
+    //
+    // 504 -> 507: `ActiveSupport.wrap(object)`, THREE sites
+    // (active_support_ext.rb, MEASURED): the `nil?` guard, the
+    // `is_a?(Array)` check, and the pass-through/one-element-wrap
+    // tail — every one a read of the sole parameter. `object` is
+    // untyped for the same reason `to_param`'s is above:
+    // `lower::array_wrap` routes `Array.wrap(x)` here as a
+    // receiver-shape rewrite, independent of `x`'s static type, so the
+    // runtime body has to accept anything. What it bought: a
+    // Procore-corpus `send_dispatch_failed` (`Array.wrap`, 189
+    // occurrences) that previously left the call with no known method
+    // at all.
+    const CEILING: usize = 507;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
