@@ -523,6 +523,84 @@ fn a_splat_of_a_resolvable_constant_inside_a_concerns_included_do_block_also_res
     );
 }
 
+// ── 7. A class-side `delegate` macro call without a block ────────────
+// Procore's real `authorize`/`permit_undeclared_actions!` are not a
+// literal `def self.x` — they're `delegate :authorize, :permit_undeclared_actions!,
+// to: :_permissions` inside `class_methods do`. `authorize(*actions, &loader)`'s
+// REAL definition takes a block, but a BLOCKLESS call
+// (`authorize :create, :update`) is ordinary actions-only registration
+// into the target's AttributeLoader — a config write, not "not
+// recognized".
+
+const DELEGATED_AUTHORIZE_CONCERN: &str = r#"
+module Permissions
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def permit_with(policy_class)
+      _permissions.permit_with(policy_class)
+      around_action(:enforce_action_policy, unless: :skip_policy_enforcement?)
+    end
+
+    delegate :authorize, :permit_undeclared_actions!, to: :_permissions
+
+    def _permissions
+      @_permissions ||= Object.new
+    end
+  end
+end
+"#;
+
+#[test]
+fn a_blockless_delegated_class_macro_classifies_as_config_not_unrecognized() {
+    let messages = survey_messages(tree(&[
+        ("app/controllers/concerns/permissions.rb", DELEGATED_AUTHORIZE_CONCERN),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include Permissions\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  authorize :create, :update\n\n  def create\n  end\nend\n",
+        ),
+    ]));
+    assert!(
+        messages.iter().any(|m| m.contains("class-body macro config not modeled")
+            && m.contains("authorize")
+            && m.contains("_permissions")),
+        "expected a config note naming the forwarding target: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("not recognized") && m.contains("authorize")),
+        "a blockless delegated macro call should not ALSO earn the generic line: {messages:?}"
+    );
+}
+
+#[test]
+fn a_blockless_delegated_class_macro_is_dropped_not_kept_as_unknown() {
+    // The config note already says what the call does; no Unknown item
+    // should remain to earn a second, less specific line downstream.
+    let app = ingest_app_from_tree(tree(&[
+        ("app/controllers/concerns/permissions.rb", DELEGATED_AUTHORIZE_CONCERN),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include Permissions\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  authorize :create, :update\n\n  def create\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let c = controller(&app, "ThingsController");
+    let unknown_count = c
+        .body
+        .iter()
+        .filter(|item| matches!(item, ControllerBodyItem::Unknown { .. }))
+        .count();
+    assert_eq!(unknown_count, 0, "the delegated macro call should be dropped, not kept Unknown: {:?}", c.body);
+}
+
 #[test]
 fn a_splat_of_an_unresolvable_constant_still_falls_back_honestly() {
     let messages = survey_messages(tree(&[
@@ -542,5 +620,52 @@ fn a_splat_of_an_unresolvable_constant_still_falls_back_honestly() {
             m.contains("controller class-body macro not recognized") && m.contains("skip_before_action")
         }),
         "an unresolvable splat must still fall back to the honest generic line, not be silently dropped: {messages:?}"
+    );
+}
+
+// ── 8. A controller's own ancestor lives under `components/*/app/` ───
+// Procore's real shape: `Rest::V2::Internal::Authorization::Context::V0::
+// DomainsController < Rest::V2::ApplicationController`, where
+// `Rest::V2::ApplicationController` — the controller that actually
+// `include`s the permissions concern — lives at `components/api/app/
+// controllers/rest/v2/application_controller.rb`, NOT under the
+// conventional root `app/controllers/`. Before `app_subdir_roots`,
+// that file was never ingested as a `Controller` at all (only files
+// directly under the app root's `app/controllers/` were), so the
+// ancestor-chain walk `expand_class_body_macros` relies on could never
+// find it, and the leaf controller's `permit_with` stayed unrecognized
+// no matter how correct everything else was.
+
+#[test]
+fn a_component_scoped_ancestor_controller_is_ingested_and_resolves_its_macro() {
+    let app = ingest_app_from_tree(tree(&[
+        ("app/controllers/concerns/permissions.rb", PERMISSIONS_CONCERN),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "components/api/app/controllers/rest/v2/application_controller.rb",
+            "module Rest\n  module V2\n    class ApplicationController < ApplicationController\n      include Permissions\n    end\n  end\nend\n",
+        ),
+        (
+            "components/auth/app/controllers/rest/v2/internal/domains_controller.rb",
+            "module Rest\n  module V2\n    module Internal\n      class DomainsController < Rest::V2::ApplicationController\n        permit_with FooPolicy\n\n        def index\n        end\n      end\n    end\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    // The component-scoped base controller itself must be ingested —
+    // not just reachable as a generic library class.
+    assert!(
+        app.controllers.iter().any(|c| c.name.0.as_str() == "Rest::V2::ApplicationController"),
+        "expected Rest::V2::ApplicationController to be ingested as a Controller: {:?}",
+        app.controllers.iter().map(|c| c.name.0.as_str()).collect::<Vec<_>>()
+    );
+    let c = controller(&app, "Rest::V2::Internal::DomainsController");
+    let fs = filters(c);
+    assert_eq!(
+        fs.iter().filter(|f| f.kind == FilterKind::Around).count(),
+        1,
+        "permit_with's around_action should resolve through the component-scoped ancestor: {fs:?}"
     );
 }

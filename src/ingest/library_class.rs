@@ -2138,6 +2138,97 @@ pub fn ingest_concern_class_method_names(source: &[u8]) -> Vec<(ClassId, Vec<Sym
     out
 }
 
+/// `delegate :authorize, :permit_undeclared_actions!, to: :_permissions`
+/// written INSIDE a concern's `class_methods do` / nested `module
+/// ClassMethods` — Rails' own `Module#delegate`, here exporting a
+/// CLASS-side macro rather than the ordinary instance-side reader
+/// (Procore's `Permissions::Controller` does exactly this, forwarding
+/// `authorize`/`permit_undeclared_actions!` to a memoized `_permissions`
+/// object). `expand_delegates_in_class` (`src/ingest/delegate.rs`)
+/// already expands a bare `delegate` declaration into a real method —
+/// but it reads from `LibraryClass::unknown_calls`, a single flat list
+/// with no memory of which scope within the file a call came from, so
+/// every delegate it expands lands as `MethodReceiver::Instance`
+/// regardless of where it was written. Fixing that generally (so the
+/// synthesized method's signature and receiver both come out right) is
+/// a bigger feature than this scan needs: `expand_class_body_macros`
+/// only needs to know THAT a controller's bare call forwards to a
+/// delegate target, not a correctly-typed method body, to classify it
+/// as a config write instead of leaving it unrecognized. This is a
+/// companion scan to `ingest_concern_class_method_names` above — same
+/// traversal, same two class-side shapes — collecting `(name, target)`
+/// pairs instead of `def` names. Scope-correct by construction: it
+/// only ever looks inside `class_methods do` / `module ClassMethods`
+/// bodies, never the surrounding instance-side body.
+pub fn ingest_concern_class_delegate_names(source: &[u8]) -> Vec<(ClassId, Vec<(Symbol, Symbol)>)> {
+    fn delegates_in(body: Option<ruby_prism::Node<'_>>, out: &mut Vec<(Symbol, Symbol)>) {
+        let Some(body) = body else { return };
+        for stmt in flatten_statements(body) {
+            let Some(call) = stmt.as_call_node() else { continue };
+            if call.receiver().is_some() || constant_id_str(&call.name()) != "delegate" {
+                continue;
+            }
+            let Some(args) = call.arguments() else { continue };
+            let mut names: Vec<Symbol> = Vec::new();
+            let mut target: Option<Symbol> = None;
+            for arg in args.arguments().iter() {
+                if let Some(sym) = symbol_value(&arg) {
+                    names.push(Symbol::from(sym.as_str()));
+                    continue;
+                }
+                let Some(kh) = arg.as_keyword_hash_node() else { continue };
+                for el in kh.elements().iter() {
+                    let Some(assoc) = el.as_assoc_node() else { continue };
+                    if symbol_value(&assoc.key()).as_deref() == Some("to") {
+                        if let Some(t) = symbol_value(&assoc.value()) {
+                            target = Some(Symbol::from(t.as_str()));
+                        }
+                    }
+                }
+            }
+            let Some(target) = target else { continue };
+            for name in names {
+                out.push((name, target.clone()));
+            }
+        }
+    }
+
+    let result = parse(source);
+    let root = result.node();
+    let mut out = Vec::new();
+    for (scope, module) in find_all_modules_with_scope(&root) {
+        let Some(name_path) = module_name_path(&module) else { continue };
+        if name_path.as_slice() == ["ClassMethods".to_string()] && !scope.is_empty() {
+            continue;
+        }
+        let mut full_path: Vec<String> = scope.clone();
+        full_path.extend(name_path);
+        let id = ClassId(Symbol::from(full_path.join("::")));
+
+        let Some(body) = module.body() else { continue };
+        let mut delegates: Vec<(Symbol, Symbol)> = Vec::new();
+        for stmt in flatten_statements(body) {
+            if let Some(m) = stmt.as_module_node() {
+                if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) {
+                    delegates_in(m.body(), &mut delegates);
+                }
+                continue;
+            }
+            if let Some(call) = stmt.as_call_node() {
+                if call.receiver().is_none() && constant_id_str(&call.name()) == "class_methods" {
+                    if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                        delegates_in(block.body(), &mut delegates);
+                    }
+                }
+            }
+        }
+        if !delegates.is_empty() {
+            out.push((id, delegates));
+        }
+    }
+    out
+}
+
 pub fn ingest_concern_filters(
     source: &[u8],
     file: &str,

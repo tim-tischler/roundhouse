@@ -23,9 +23,9 @@ use super::expr::ingest_ruby_program;
 use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
-    ClassKind, classify_class_file, ingest_concern_class_method_names,
-    ingest_concern_filters, ingest_concern_model_items, ingest_helper_method_names,
-    ingest_library_classes, ingest_rails_application_singleton_methods,
+    ClassKind, classify_class_file, ingest_concern_class_delegate_names,
+    ingest_concern_class_method_names, ingest_concern_filters, ingest_concern_model_items,
+    ingest_helper_method_names, ingest_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model;
 use super::routes::ingest_routes_with_draws;
@@ -210,6 +210,19 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         crate::ident::ClassId,
         Vec<crate::ident::Symbol>,
     )> = Vec::new();
+    // `delegate :x, to: :y` written inside the SAME `class_methods do` /
+    // `ClassMethods` carrier — read by `expand_class_body_macros` so a
+    // controller's bare call to a class-side delegate (Procore's
+    // `Permissions::Controller`'s `authorize`/`permit_undeclared_actions!`,
+    // forwarded to `_permissions`) classifies as a config write instead
+    // of falling to the generic "not recognized" bucket. See
+    // `ingest_concern_class_delegate_names`'s doc comment for why this
+    // is a separate, lightweight scan rather than a fix to
+    // `expand_delegates_in_class` itself.
+    let mut concern_class_delegate_names: Vec<(
+        crate::ident::ClassId,
+        Vec<(crate::ident::Symbol, crate::ident::Symbol)>,
+    )> = Vec::new();
 
     // The app's inflections come first: everything after this that
     // turns `:leaves` into a class name or `Leaf` into a table name
@@ -357,6 +370,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         app.concern_model_items.extend(concern_items);
                         concern_class_method_names
                             .extend(ingest_concern_class_method_names(&source));
+                        concern_class_delegate_names
+                            .extend(ingest_concern_class_delegate_names(&source));
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
                         concern_enums.extend(concern_enum_decls);
@@ -939,65 +954,68 @@ end
         }
     }
 
-    let controllers_dir = dir.join("app/controllers");
-    if vfs.is_dir(&controllers_dir) {
-        for entry in read_rb_files(vfs, &controllers_dir)? {
-            let source = vfs.read(&entry)?;
-            let path_str = entry.display().to_string();
-            if let Some(maybe_controller) =
-                unwrap_or_record(ingest_controller(&source, &path_str))?
-            {
-                if let Some(controller) = maybe_controller {
-                    // `helper_method :x` exposes controller methods to
-                    // templates. The ARG-PURE ones (no ivar reads)
-                    // register like app-helper functions — the bare
-                    // view call rewrites to `<Controller>.x(args)`
-                    // against a class-side clone the controller
-                    // lowering synthesizes. Registered before the
-                    // app/helpers pass below, so a same-named helper-
-                    // module function wins (its insert overwrites).
-                    for name in crate::lower::controller_to_library::controller_helper_method_names(
-                        &controller,
-                    ) {
-                        app.helper_method_index.insert(name, controller.name.clone());
-                    }
-                    // `helper_method :platform` written directly in a
-                    // controller class body — the concern spelling is
-                    // picked up at the module branch below.
-                    app.view_visible_controller_methods
-                        .extend(ingest_helper_method_names(&source));
-                    let outer = controller.name.clone();
-                    app.controllers.push(controller);
-                    // Same as the models above: a class nested in the
-                    // controller's body is its own class, registered
-                    // from this file by the library ingest.
-                    if let Some(classes) =
-                        unwrap_or_record(ingest_library_classes(&source, &path_str))?
-                    {
-                        app.library_classes.extend(nested_under(&outer, classes));
-                    }
-                } else {
-                    // No class in the file — a module: a concern under
-                    // app/controllers/concerns/ (`AccountOwnedConcern`)
-                    // or a mixin like `Authorization`. Ingest as a
-                    // library class so its methods register and
-                    // `include X` dispatch (ClassInfo.includes) can
-                    // resolve into it, and capture its `included do`
-                    // filter declarations for every includer's chain.
-                    if let Some(classes) =
-                        unwrap_or_record(ingest_library_classes(&source, &path_str))?
-                    {
-                        app.library_classes.extend(classes);
-                        app.concern_filters
-                            .extend(ingest_concern_filters(&source, &path_str));
-                        let (concern_items, concern_enum_decls) =
-                            ingest_concern_model_items(&source, &path_str);
-                        app.concern_model_items.extend(concern_items);
-                        concern_class_method_names
-                            .extend(ingest_concern_class_method_names(&source));
+    for controllers_dir in app_subdir_roots(vfs, dir, "controllers") {
+        if vfs.is_dir(&controllers_dir) {
+            for entry in read_rb_files(vfs, &controllers_dir)? {
+                let source = vfs.read(&entry)?;
+                let path_str = entry.display().to_string();
+                if let Some(maybe_controller) =
+                    unwrap_or_record(ingest_controller(&source, &path_str))?
+                {
+                    if let Some(controller) = maybe_controller {
+                        // `helper_method :x` exposes controller methods to
+                        // templates. The ARG-PURE ones (no ivar reads)
+                        // register like app-helper functions — the bare
+                        // view call rewrites to `<Controller>.x(args)`
+                        // against a class-side clone the controller
+                        // lowering synthesizes. Registered before the
+                        // app/helpers pass below, so a same-named helper-
+                        // module function wins (its insert overwrites).
+                        for name in crate::lower::controller_to_library::controller_helper_method_names(
+                            &controller,
+                        ) {
+                            app.helper_method_index.insert(name, controller.name.clone());
+                        }
+                        // `helper_method :platform` written directly in a
+                        // controller class body — the concern spelling is
+                        // picked up at the module branch below.
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
-                        concern_enums.extend(concern_enum_decls);
+                        let outer = controller.name.clone();
+                        app.controllers.push(controller);
+                        // Same as the models above: a class nested in the
+                        // controller's body is its own class, registered
+                        // from this file by the library ingest.
+                        if let Some(classes) =
+                            unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                        {
+                            app.library_classes.extend(nested_under(&outer, classes));
+                        }
+                    } else {
+                        // No class in the file — a module: a concern under
+                        // app/controllers/concerns/ (`AccountOwnedConcern`)
+                        // or a mixin like `Authorization`. Ingest as a
+                        // library class so its methods register and
+                        // `include X` dispatch (ClassInfo.includes) can
+                        // resolve into it, and capture its `included do`
+                        // filter declarations for every includer's chain.
+                        if let Some(classes) =
+                            unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                        {
+                            app.library_classes.extend(classes);
+                            app.concern_filters
+                                .extend(ingest_concern_filters(&source, &path_str));
+                            let (concern_items, concern_enum_decls) =
+                                ingest_concern_model_items(&source, &path_str);
+                            app.concern_model_items.extend(concern_items);
+                            concern_class_method_names
+                                .extend(ingest_concern_class_method_names(&source));
+                            concern_class_delegate_names
+                                .extend(ingest_concern_class_delegate_names(&source));
+                            app.view_visible_controller_methods
+                                .extend(ingest_helper_method_names(&source));
+                            concern_enums.extend(concern_enum_decls);
+                        }
                     }
                 }
             }
@@ -1409,7 +1427,7 @@ end
     splice_concerns_into_controllers(&mut app);
     // After the splice: a macro has to resolve against the concern's
     // class-side methods, and its expansion joins the same filter chain.
-    expand_class_body_macros(&mut app);
+    expand_class_body_macros(&mut app, &concern_class_delegate_names);
     // A splat-of-constant filter target (`skip_before_action(*Jwt::
     // TRADITIONAL_AUTHENTICATION_METHODS, only: [...])`) needs the
     // WHOLE app's constants to resolve, which only exists now — after
@@ -2633,9 +2651,23 @@ fn resolve_const_splat_filters(app: &mut App) {
 /// unless: :skip_policy_enforcement?)` (real filter DSL) — the old
 /// policy dropped the around_action entirely; this expands it and
 /// notes the config write quietly instead.
-fn expand_class_body_macros(app: &mut App) {
+fn expand_class_body_macros(
+    app: &mut App,
+    concern_delegates: &[(crate::ident::ClassId, Vec<(Symbol, Symbol)>)],
+) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::expr::ExprNode;
+
+    // `(name -> target)` per concern, for a class-side `delegate` this
+    // pass can't give a real `MethodDef` (see `ingest_concern_class_
+    // delegate_names`'s doc comment) but can still recognize directly:
+    // a bare, blockless call to one of these names is the CONFIG shape
+    // `describe_config_write` already names elsewhere, just reached
+    // from the call site rather than a macro body's own statement.
+    let delegate_targets: HashMap<crate::ident::ClassId, HashMap<Symbol, Symbol>> = concern_delegates
+        .iter()
+        .map(|(id, pairs)| (id.clone(), pairs.iter().cloned().collect()))
+        .collect();
 
     // Class-side methods of every module, by name — the macro table.
     // Populated from library classes because that is where a concern's
@@ -2714,7 +2746,7 @@ fn expand_class_body_macros(app: &mut App) {
         .map(|c| (c.name.clone(), c.actions().map(|a| (a.name.clone(), a.body.clone())).collect()))
         .collect();
 
-    if macros.is_empty() && self_actions.values().all(|m| m.is_empty()) {
+    if macros.is_empty() && self_actions.values().all(|m| m.is_empty()) && delegate_targets.is_empty() {
         return;
     }
 
@@ -2768,6 +2800,44 @@ fn expand_class_body_macros(app: &mut App) {
                     })
                 });
             let Some(found) = found else {
+                // Last resort: a bare, blockless call to a name a
+                // reachable concern DELEGATES from its class-methods
+                // scope (Procore's `delegate :authorize, :permit_
+                // undeclared_actions!, to: :_permissions` inside
+                // `Permissions::Controller`'s own `class_methods do`).
+                // There is no `MethodDef` here to classify statement by
+                // statement — the delegate declaration IS the whole
+                // story — so it is recognized directly as the CONFIG
+                // shape it is: forwarding the call's own arguments to a
+                // class-level object, the same idiom `describe_config_
+                // write`'s "forwards to X" case names, just reached
+                // from the call site instead of a substituted
+                // statement. A call WITH a block is left alone (falls
+                // through unchanged below) — this scan has no signature
+                // to check a block parameter against, so it only
+                // handles the shape it can tell apart confidently.
+                if block.is_none() {
+                    if let Some(target) = includes
+                        .iter()
+                        .find_map(|inc| delegate_targets.get(inc).and_then(|m| m.get(method)).cloned())
+                    {
+                        survey::record(&IngestError::Unsupported {
+                            file: controller.name.0.as_str().to_string(),
+                            message: format!(
+                                "class-body macro config not modeled: `{}` forwards to `{}`",
+                                method.as_str(),
+                                target.as_str()
+                            ),
+                        });
+                        // Dropped, not kept as Unknown: the config note
+                        // above already says precisely what this call
+                        // does, and an Unknown item is never emitted
+                        // either way — keeping it around would only
+                        // earn it a second, less specific "not
+                        // recognized" line below.
+                        continue;
+                    }
+                }
                 expanded.push(item);
                 continue;
             };
@@ -2834,7 +2904,8 @@ fn expand_class_body_macros(app: &mut App) {
                 &mut expansion,
             );
 
-            if !expansion.config_notes.is_empty() {
+            let had_config_note = !expansion.config_notes.is_empty();
+            if had_config_note {
                 survey::record(&IngestError::Unsupported {
                     file: controller.name.0.as_str().to_string(),
                     message: format!(
@@ -2865,7 +2936,16 @@ fn expand_class_body_macros(app: &mut App) {
             }
 
             if expansion.filters.is_empty() {
-                expanded.push(item);
+                // A config note already said precisely what this call
+                // does; keeping the Unknown item around would only
+                // earn it a SECOND, less specific "not recognized" line
+                // from `report_unrecognized_controller_macros` below.
+                // Dropping it costs nothing at emit time either way —
+                // an Unknown item is informational-only, never emitted
+                // (`split_public_private`'s own doc comment).
+                if !had_config_note {
+                    expanded.push(item);
+                }
             } else {
                 let mut comments = leading_comments.clone();
                 let mut blank = *leading_blank_line;
@@ -4132,6 +4212,61 @@ fn nested_under(
     classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
 }
 
+/// Directories under `app/` that another pass already ingests (models,
+/// controllers, views, helpers) or that hold no Ruby at all (assets,
+/// javascript) — shared between `support_roots`'s root-level scan and
+/// its per-component one below.
+const OWN_PASS: &[&str] = &["models", "controllers", "views", "helpers", "assets", "javascript"];
+
+/// The modular-monolith component/pack directories this app has, as
+/// their OWN `app/` root — Procore's `components/*/`, Packwerk's
+/// `packs/*/`. Each holds a full second copy of the conventional
+/// layers (`components/document_markup/app/services/`, its own
+/// `app/models`, `app/controllers`, …), discovered structurally by
+/// directory SHAPE rather than by parsing `config/application.rb`'s
+/// eager/autoload paths: `extract_autoload_path_roots` already tries
+/// that, but Procore's own `ProcoreOS::ModularMonolith::Paths.
+/// component_paths do |p| config.eager_load_paths << p end` is a
+/// dynamic enumeration with no literal string for a line-scanner to
+/// find. A component with no `app/` directory of its own (vanishingly
+/// rare, but real for a component that is pure Rake tasks or docs)
+/// contributes nothing — `is_dir` below is the only requirement.
+fn modular_monolith_app_dirs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for group in ["components", "packs"] {
+        let group_dir = dir.join(group);
+        if !vfs.is_dir(&group_dir) {
+            continue;
+        }
+        let Ok(entries) = vfs.read_dir(&group_dir) else { continue };
+        for entry in entries {
+            if vfs.is_dir(&entry) {
+                let app_dir = entry.join("app");
+                if vfs.is_dir(&app_dir) {
+                    out.push(app_dir);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every directory that functions as an `app/<leaf>` root for this
+/// app: the conventional root `app/<leaf>`, plus one per modular-
+/// monolith component/pack (`modular_monolith_app_dirs` above) —
+/// `components/document_markup/app/services`, say, alongside the
+/// root's own `app/services`. Used by the controllers walk
+/// (`expand_class_body_macros`'s ancestor-chain resolution needs a
+/// component's OWN base controller — `components/api/app/controllers/
+/// rest/v2/application_controller.rb` — to actually BE ingested as a
+/// `Controller`, not just as a generic library class, or nothing that
+/// inherits through it ever sees what it includes).
+fn app_subdir_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path, leaf: &str) -> Vec<PathBuf> {
+    let mut roots = vec![dir.join("app").join(leaf)];
+    roots.extend(modular_monolith_app_dirs(vfs, dir).into_iter().map(|d| d.join(leaf)));
+    roots
+}
+
 /// The support roots to walk for library classes: every `app/*`
 /// subdirectory that has no ingest pass of its own, plus `extras` and
 /// `lib`, plus whatever `config/application.rb` puts on the autoload or
@@ -4151,13 +4286,23 @@ fn nested_under(
 /// A LIST OF ROOTS on purpose: a Packwerk app puts the same layers under
 /// `packs/*/app/*`, which becomes one more source of roots here rather
 /// than a second walker.
+///
+/// NOT YET extended to `modular_monolith_app_dirs` (components/packs)
+/// the way `app_subdir_roots` is for controllers — tried and reverted.
+/// Reusing it here (once per component, same enumeration) correctly
+/// discovers far more library classes (e.g. `DocumentMarkup::Jwt` at
+/// `components/document_markup/app/services/jwt.rb`), but it also feeds
+/// `config/initializers/inflections.rb`-shaped files through
+/// `ingest_library_classes` at a scale this pass apparently cannot
+/// handle cleanly: on procore-slim it took one genuine, narrow,
+/// pre-existing gap (4 stable parse-error lines for the root app's own
+/// `config/initializers/inflections.rb` — `ActiveSupport::Inflector`
+/// reopened alongside `class String`) and turned it into ~95 lines at
+/// wildly varying positions against the SAME file path — a real
+/// regression this change could not safely root-cause and fix in the
+/// time available. Left out of this PR; see its notes for the
+/// diagnostic trail (isolated by toggling exactly this loop on/off).
 fn support_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lib_ignores: &[String]) -> Vec<String> {
-    // Directories under `app/` that another pass already ingests
-    // (models, controllers, views, helpers) or that hold no Ruby at all
-    // (assets, javascript).
-    const OWN_PASS: &[&str] =
-        &["models", "controllers", "views", "helpers", "assets", "javascript"];
-
     let mut roots: Vec<String> = vec!["extras".to_string(), "lib".to_string()];
     if let Ok(entries) = vfs.read_dir(&dir.join("app")) {
         for entry in entries {
