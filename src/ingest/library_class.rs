@@ -20,7 +20,7 @@ use super::expr::ingest_expr;
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
     find_all_modules_with_scope, find_first_class, flatten_statements, module_name_path,
-    symbol_value,
+    module_new_block, symbol_value,
 };
 use super::{IngestError, IngestResult};
 
@@ -1306,6 +1306,63 @@ fn walk_decl_body<'pr>(
                         continue;
                     }
                 }
+                // `extend(Module.new { … })` — P19t's spelling of the
+                // same "extend self" idea below, one level more
+                // anonymous: instead of naming a sibling module, the
+                // module literal is built inline as the `extend`
+                // argument. Ruby's `extend` makes every instance
+                // method of the argument a singleton method of the
+                // receiver, so `P19t.f` / `P19t.l` (aliased inside the
+                // literal from `formatted_localized` / `localized`)
+                // need to resolve on `P19t` itself.
+                //
+                // Previously this fell through to the generic
+                // "unrecognized call" capture below: `ingest_expr` on
+                // the whole `extend(...)` statement treats it as one
+                // opaque expression and never descends into the block
+                // argument, so every `def` and `alias_method` inside
+                // it — P19t's entire public surface — was silently
+                // dropped. Walked here the same way `class_methods do`
+                // is above: the block's body becomes Class-receiver
+                // methods of the enclosing module.
+                if kw == "extend" {
+                    if let Some(args) = call.arguments() {
+                        let arg_list: Vec<_> = args.arguments().iter().collect();
+                        if let [arg] = &arg_list[..] {
+                            if let Some(block) = module_new_block(arg) {
+                                let (
+                                    inner_includes,
+                                    inner_methods,
+                                    inner_constants,
+                                    inner_unknown,
+                                ) = walk_decl_body(block.body(), owner, file, true)?;
+                                includes.extend(inner_includes);
+                                methods.extend(inner_methods);
+                                constants.extend(inner_constants);
+                                unknown_calls.extend(inner_unknown);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // `alias_method :new_name, :old_name` directly in a
+                // class/module body (not only inside a `class << self`
+                // block — see model.rs's `ingest_singleton_class_methods`
+                // for that sibling case). P19t's `extend(Module.new {
+                // … })` literal above is the motivating caller, but any
+                // library class can write this in its own body.
+                // Resolves to a clone of the already-ingested target
+                // under the new name; `alias_method` always follows its
+                // target in this corpus. A target not yet in `methods`
+                // (defined later, or in a scope this walk doesn't
+                // reach) falls through to the generic unknown-call
+                // capture below instead of silently vanishing.
+                if kw == "alias_method" {
+                    if let Some(alias) = resolve_alias_method(&call, &methods) {
+                        methods.push(alias);
+                        continue;
+                    }
+                }
                 match kw {
                     "include" => {
                         if let Some(args) = call.arguments() {
@@ -1549,6 +1606,31 @@ fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
             None => return false,
         }
     }
+}
+
+/// `alias_method :new_name, :old_name` resolved against the methods
+/// already ingested earlier in the same body walk. Mirrors
+/// model.rs's `ingest_singleton_class_methods` handling of the same
+/// call for a model's `class << self` block — cloning the target
+/// under the new name, since `alias_method` always follows its target
+/// in this corpus. Returns `None` (rather than synthesizing a
+/// methodless alias) when the target isn't resolvable, so the caller
+/// can fall through to the generic unknown-call capture instead of
+/// silently dropping the alias.
+fn resolve_alias_method(
+    call: &ruby_prism::CallNode<'_>,
+    methods: &[MethodDef],
+) -> Option<MethodDef> {
+    let args = call.arguments()?;
+    let args: Vec<_> = args.arguments().iter().collect();
+    let [new_name, old_name] = &args[..] else { return None };
+    let new_name = symbol_value(new_name)?;
+    let old_name = symbol_value(old_name)?;
+    let target = methods.iter().find(|m| m.name.as_str() == old_name)?;
+    let mut alias = target.clone();
+    alias.name = Symbol::from(new_name);
+    alias.name_span = Span::synthetic();
+    Some(alias)
 }
 
 fn normalize_classvars_to_ivars(e: &mut Expr) {

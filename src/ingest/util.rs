@@ -297,6 +297,29 @@ fn body_has_included_block(body: Option<Node<'_>>) -> bool {
     false
 }
 
+/// `Module.new { … }` / `Module.new do … end` — the anonymous module
+/// literal built directly as a call argument (as opposed to assigned
+/// to a constant first, which ingests as an ordinary nested `module`).
+/// Returns its block so the caller can walk the body as the literal's
+/// method set. Used to recognize `extend(Module.new { … })`, P19t's
+/// shape in `app/lib/p19t.rb`: both here (so the module even gets
+/// surfaced as a `LibraryClass` to begin with — collect_modules above
+/// requires `module_has_direct_def`, and a module whose only content
+/// is the `extend` call has no DIRECT def of its own) and in
+/// `library_class.rs::walk_decl_body` (so the literal's `def`s and
+/// `alias_method`s actually get ingested as the module's methods).
+pub(super) fn module_new_block<'pr>(node: &Node<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    let call = node.as_call_node()?;
+    if call.name().as_slice() != b"new" {
+        return None;
+    }
+    let cr = call.receiver()?.as_constant_read_node()?;
+    if cr.name().as_slice() != b"Module" {
+        return None;
+    }
+    call.block()?.as_block_node()
+}
+
 /// Whether the body has anything that lowers to a method on the
 /// enclosing scope: a direct `def`, an `attr_*` call, or a
 /// `class << self` block whose body contains the same. Used to decide
@@ -321,6 +344,28 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
                     if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
                         if body_has_direct_method_decl(block.body()) {
                             return true;
+                        }
+                    }
+                }
+                // `extend(Module.new { … })` — P19t's spelling of
+                // "extend self" for an anonymous literal rather than a
+                // named sibling module (`library_class.rs`'s
+                // `walk_decl_body` has the full rationale). Without
+                // this arm, `module_has_direct_def` never found P19t
+                // worth surfacing at all: every `def` and
+                // `alias_method` lives one level deeper, inside the
+                // literal's block, and this function only looks at
+                // `stmt` itself — the module's body has exactly one
+                // statement, the `extend` call, no DIRECT def in sight.
+                if kw == "extend" {
+                    if let Some(args) = call.arguments() {
+                        let arg_list: Vec<_> = args.arguments().iter().collect();
+                        if let [arg] = &arg_list[..] {
+                            if let Some(block) = module_new_block(arg) {
+                                if body_has_direct_method_decl(block.body()) {
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
